@@ -3,6 +3,7 @@ package com.grin.sanbotrosbridge;
 import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.graphics.drawable.GradientDrawable;
+import android.media.AudioManager;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -546,17 +547,24 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
             try {
                 JSONObject json = new JSONObject(message);
                 String texto = json.optString("msg", "");
+                // speed/volume are 0–100. Defaults preserve prior behaviour (hardcoded speed 50, full Android volume).
+                int speed = clampInt(json.optInt("speed", 50), 0, 100);
+                int volume = clampInt(json.optInt("volume", 100), 0, 100);
                 if (!texto.isEmpty()) {
                     if (switchTtsType.isChecked()) {
-                        handleSpeakSDK(texto);
+                        handleSpeakSDK(texto, speed, volume);
                     } else {
-                        handleSpeakAndroid(texto);
+                        handleSpeakAndroid(texto, speed, volume);
                     }
                 }
             } catch (Exception e) {
                 e.printStackTrace();
             }
         }
+    }
+
+    private static int clampInt(int value, int min, int max) {
+        return Math.max(min, Math.min(max, value));
     }
 
     private void handleLightControl(String message) {
@@ -765,26 +773,46 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
         }
     }
 
-    private void handleSpeakAndroid(String texto) {
+    private void handleSpeakAndroid(String texto, int speed, int volume) {
         if (tts != null) {
             tts.stop();
-            tts.speak(texto, TextToSpeech.QUEUE_FLUSH, null, "mqtt_speak");
+            // Map SpeakOption-style 0–100 speed onto Android TTS rate (~1.0 at 50).
+            float rate = speed / 50.0f;
+            if (rate < 0.3f) rate = 0.3f;
+            if (rate > 2.0f) rate = 2.0f;
+            tts.setSpeechRate(rate);
+
+            Bundle params = new Bundle();
+            params.putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, volume / 100.0f);
+            tts.speak(texto, TextToSpeech.QUEUE_FLUSH, params, "mqtt_speak");
         }
     }
 
-    private void handleSpeakSDK(String texto){
+    private void handleSpeakSDK(String texto, int speed, int volume) {
         if (speechManager != null) {
             SpeakOption speakOption = new SpeakOption();
-            
+
             // Obtém o idioma selecionado no spinner
             String selectedLanguage = spinnerLanguage.getSelectedItem().toString();
             speakOption.setLanguageType(getSdkLanguageType(selectedLanguage));
-            
-            speakOption.setSpeed(50);      // Velocidade de fala (0 a 100)
+
+            speakOption.setSpeed(speed); // Velocidade de fala (0 a 100) from MQTT
             speakOption.setIntonation(50); // Entonação (0 a 100)
+            // SpeakOption.level (1–10) has no public setter in OpenSDK; approximate via music stream.
+            applyMusicStreamVolume(volume);
             speechManager.stopSpeak();
             speechManager.startSpeak(texto, speakOption);
         }
+    }
+
+    /** Best-effort loudness for SDK TTS (SpeakOption volume is not publicly settable). */
+    private void applyMusicStreamVolume(int volume0to100) {
+        AudioManager am = (AudioManager) getSystemService(AUDIO_SERVICE);
+        if (am == null) return;
+        int max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+        if (max <= 0) return;
+        int index = Math.round(max * (volume0to100 / 100.0f));
+        am.setStreamVolume(AudioManager.STREAM_MUSIC, clampInt(index, 0, max), 0);
     }
 
     @Override

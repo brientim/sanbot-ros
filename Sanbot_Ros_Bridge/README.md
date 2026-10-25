@@ -148,11 +148,15 @@ Below is a quick reference of the MQTT topics and RTMP transmission to understoo
 | `ros/light` | White forehead LED (brightness) | `{ "white": 0-3 }` | `{ "white": 2 }` |
 | `ros/led` | Color LEDs (head / hands) | `{ "part": string, "mode": string, "duration": int }` | `{ "part": "all_head", "mode": "blue", "duration": 5 }` |
 | `ros/joints` | Head & wing servos | `{ "joint": string, "angle": int°, "speed": int%? }` | `{ "joint": "head_pan", "angle": 45 }` |
-| `ros/speak` | Text-to-Speech | `{ "msg": string }` | `{ "msg": "Hello, I am Sanbot" }` |
+| `/speak` (or `/{namespace}/speak`) | Text-to-Speech | `{ "msg": string, "speed": 0-100?, "volume": 0-100? }` | `{ "msg": "Hello, I am Sanbot", "speed": 30, "volume": 70 }` |
 
 Notes
 * Optional fields may be omitted.
 * Angles are integers in **degrees**; speeds are percentages `0-100`.
+* **`/speak`:** `speed` defaults to **50** (previous hard-coded value). `volume` defaults to **100**.
+  - **TTS SDK:** `speed` → `SpeakOption.setSpeed`; `volume` best-effort via Android music stream (OpenSDK exposes no public volume setter).
+  - **TTS Android:** `speed` → `TextToSpeech.setSpeechRate` (1.0 ≈ 50); `volume` → `KEY_PARAM_VOLUME`.
+* Topic names in the live app are slash-prefixed (`/speak`, `/move`, …), not the older `ros/…` labels in some docs.
 
 ### 2. Robot → ROS (App publishes)
 | MQTT topic | Content | Example payload |
