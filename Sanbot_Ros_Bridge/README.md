@@ -124,9 +124,13 @@ roslaunch sanbot_ros app_bridge.launch
      ```bash
      hostname -I | awk '{print $1}'
      ```
-   * In the app top field, enter this IP in **Server IP**.
-   * Tap **Connect** to establish the MQTT link.
-   * Enable the RTMP camera stream by toggling the **Camera** switch.
+   * In **MQTT Configuration**, set **IP Address** (and **Port** if not `1883`). **Namespace** is optional (empty → topics like `/battery`; `nano` → `/nano/battery`).
+   * Tap **Connect**. Optionally leave **Auto-connect on launch** / **Auto-launch on boot** enabled so the app reconnects after reboot.
+   * Enable the RTMP camera stream with **RTMP ON/OFF**.
+
+![MQTT Configuration UI on Sanbot Nano](assets/mqtt-configuration-new-features.jpg)
+
+*MQTT Configuration (Namespace / IP / Port), Auto-connect, Auto-launch, and two-column Options on the Nano head screen.*
 
 4. In a ROS terminal you should see topics appearing, e.g.:
 

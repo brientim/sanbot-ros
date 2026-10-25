@@ -62,6 +62,7 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
 
     private EditText editTextName;
     private EditText editTextIp;
+    private EditText editTextPort;
     private Button buttonConnect;
     private Button buttonClear;
     private Spinner spinnerTopics;
@@ -71,6 +72,8 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
     private SurfaceView surfaceViewPreview;
     private Spinner spinnerLanguage;
     private CheckBox checkBoxShowLogs;
+    private CheckBox checkBoxAutoConnect;
+    private CheckBox checkBoxAutoLaunch;
     private Switch switchTtsType;
     private ArrayAdapter<String> androidLanguageAdapter;
     private ArrayAdapter<String> sdkLanguageAdapter;
@@ -83,6 +86,9 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
     private static final String PREFS_NAME = "mqtt_prefs";
     private static final String KEY_LAST_IP = "last_broker_ip";
     private static final String KEY_LAST_NAME = "last_robot_name";
+    private static final String KEY_LAST_PORT = "last_broker_port";
+    private static final String KEY_AUTO_CONNECT = "auto_connect";
+    private static final String KEY_AUTO_LAUNCH = "auto_launch";
     private static final int CAMERA_PERMISSION_REQUEST_CODE = 200;
 
     private SystemManager systemManager;
@@ -127,6 +133,7 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
 
         editTextName = findViewById(R.id.editTextName);
         editTextIp = findViewById(R.id.editTextIp);
+        editTextPort = findViewById(R.id.editTextPort);
         buttonConnect = findViewById(R.id.buttonConnect);
         buttonClear = findViewById(R.id.buttonClear);
         spinnerTopics = findViewById(R.id.spinnerTopics);
@@ -137,6 +144,8 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
         switchRtmp = findViewById(R.id.switchRtmp);
         spinnerLanguage = findViewById(R.id.spinnerLanguage);
         checkBoxShowLogs = findViewById(R.id.checkBoxShowLogs);
+        checkBoxAutoConnect = findViewById(R.id.checkBoxAutoConnect);
+        checkBoxAutoLaunch = findViewById(R.id.checkBoxAutoLaunch);
         switchTtsType = findViewById(R.id.switchTtsType);
 
         // Configuração inicial da visibilidade dos elementos de log
@@ -154,11 +163,22 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
         if (lastIp != null) {
             editTextIp.setText(lastIp);
         }
+        String lastPort = prefs.getString(KEY_LAST_PORT, "1883");
+        if (editTextPort != null && lastPort != null) {
+            editTextPort.setText(lastPort);
+        }
+        if (checkBoxAutoConnect != null) {
+            checkBoxAutoConnect.setChecked(prefs.getBoolean(KEY_AUTO_CONNECT, true));
+        }
+        if (checkBoxAutoLaunch != null) {
+            checkBoxAutoLaunch.setChecked(prefs.getBoolean(KEY_AUTO_LAUNCH, true));
+        }
         robotName = editTextName.getText().toString().trim();
 
         mqttHandler = new MqttHandler(this, this);
 
         mqttHandler.setBrokerIp(lastIp);
+        applyBrokerPortToHandler();
 
         // Configuração dos adaptadores de idioma
         androidLanguageAdapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, 
@@ -194,15 +214,19 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
                 return;
             }
 
+            String port = readBrokerPort();
             getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
                     .edit()
                     .putString(KEY_LAST_IP, ip)
                     .putString(KEY_LAST_NAME, editTextName.getText().toString().trim())
+                    .putString(KEY_LAST_PORT, port)
                     .apply();
 
             robotName = editTextName.getText().toString().trim();
 
             if (!connected) {
+                mqttHandler.setBrokerIp(ip);
+                applyBrokerPortToHandler();
                 mqttHandler.connect();
                 buttonConnect.setEnabled(false);
                 buttonConnect.setText("Conectando...");
@@ -213,6 +237,21 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
                 appendMessage("Disconnected from broker.");
             }
         });
+
+        if (checkBoxAutoConnect != null) {
+            checkBoxAutoConnect.setOnCheckedChangeListener((buttonView, isChecked) ->
+                    getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                            .edit()
+                            .putBoolean(KEY_AUTO_CONNECT, isChecked)
+                            .apply());
+        }
+        if (checkBoxAutoLaunch != null) {
+            checkBoxAutoLaunch.setOnCheckedChangeListener((buttonView, isChecked) ->
+                    getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                            .edit()
+                            .putBoolean(KEY_AUTO_LAUNCH, isChecked)
+                            .apply());
+        }
 
         buttonClear.setOnClickListener(v -> textViewMessages.setText(""));
 
@@ -306,6 +345,40 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
                 }
             }
         });
+
+        maybeAutoConnect();
+    }
+
+    private String readBrokerPort() {
+        if (editTextPort == null) {
+            return "1883";
+        }
+        String port = editTextPort.getText().toString().trim();
+        return port.isEmpty() ? "1883" : port;
+    }
+
+    private void applyBrokerPortToHandler() {
+        if (mqttHandler == null) {
+            return;
+        }
+        mqttHandler.setBrokerPort(readBrokerPort());
+    }
+
+    /** Connect automatically when a saved broker IP exists and the checkbox is on. */
+    private void maybeAutoConnect() {
+        if (checkBoxAutoConnect == null || !checkBoxAutoConnect.isChecked()) {
+            return;
+        }
+        String ip = editTextIp.getText().toString().trim();
+        if (ip.isEmpty() || connected || mqttHandler == null) {
+            return;
+        }
+        mqttHandler.setBrokerIp(ip);
+        applyBrokerPortToHandler();
+        mqttHandler.connect();
+        buttonConnect.setEnabled(false);
+        buttonConnect.setText("Conectando...");
+        appendMessage("Auto-connecting to broker...");
     }
 
     @Override
@@ -547,10 +620,12 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
                 JSONObject json = new JSONObject(message);
                 String texto = json.optString("msg", "");
                 if (!texto.isEmpty()) {
+                    int speed = json.optInt("speed", 50);
+                    int volume = json.optInt("volume", 70);
                     if (switchTtsType.isChecked()) {
-                        handleSpeakSDK(texto);
+                        handleSpeakSDK(texto, speed, volume);
                     } else {
-                        handleSpeakAndroid(texto);
+                        handleSpeakAndroid(texto, speed, volume);
                     }
                 }
             } catch (Exception e) {
@@ -765,23 +840,31 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
         }
     }
 
-    private void handleSpeakAndroid(String texto) {
+    private void handleSpeakAndroid(String texto, int speed, int volume) {
         if (tts != null) {
             tts.stop();
-            tts.speak(texto, TextToSpeech.QUEUE_FLUSH, null, "mqtt_speak");
+            // Android TTS rate ~0.5–2.0; map MQTT speed 0–100 around 1.0
+            float rate = 0.5f + (Math.max(0, Math.min(100, speed)) / 100f);
+            tts.setSpeechRate(rate);
+            // STREAM_MUSIC volume 0–1
+            float gain = Math.max(0, Math.min(100, volume)) / 100f;
+            android.os.Bundle params = new android.os.Bundle();
+            params.putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, gain);
+            tts.speak(texto, TextToSpeech.QUEUE_FLUSH, params, "mqtt_speak");
         }
     }
 
-    private void handleSpeakSDK(String texto){
+    private void handleSpeakSDK(String texto, int speed, int volume) {
         if (speechManager != null) {
             SpeakOption speakOption = new SpeakOption();
-            
+
             // Obtém o idioma selecionado no spinner
             String selectedLanguage = spinnerLanguage.getSelectedItem().toString();
             speakOption.setLanguageType(getSdkLanguageType(selectedLanguage));
-            
-            speakOption.setSpeed(50);      // Velocidade de fala (0 a 100)
-            speakOption.setIntonation(50); // Entonação (0 a 100)
+
+            speakOption.setSpeed(Math.max(0, Math.min(100, speed)));
+            speakOption.setIntonation(50);
+            // volume is applied for Android TTS; SDK SpeakOption keeps speed/intonation here
             speechManager.stopSpeak();
             speechManager.startSpeak(texto, speakOption);
         }

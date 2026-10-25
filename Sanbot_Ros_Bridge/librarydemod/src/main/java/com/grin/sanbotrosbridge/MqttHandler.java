@@ -23,6 +23,7 @@ public class MqttHandler {
     private MqttAsyncClient mqttClient;
     private Context context;
     private String brokerIp = "192.168.0.101";
+    private String brokerPort = "1883";
     private boolean isConnected = false;
     private List<String> topicList;
     private List<String> subscribedTopics = new ArrayList<>();
@@ -59,6 +60,14 @@ public class MqttHandler {
         this.brokerIp = ip;
     }
 
+    public void setBrokerPort(String port) {
+        if (port == null || port.trim().isEmpty()) {
+            this.brokerPort = "1883";
+        } else {
+            this.brokerPort = port.trim();
+        }
+    }
+
     public boolean isConnected() {
         return isConnected;
     }
@@ -78,7 +87,8 @@ public class MqttHandler {
 
         // Criar identificador de cliente único
         String clientId = "AndroidClient-" + UUID.randomUUID().toString();
-        String serverUri = "tcp://" + brokerIp + ":1883";
+        String port = (brokerPort == null || brokerPort.isEmpty()) ? "1883" : brokerPort;
+        String serverUri = "tcp://" + brokerIp + ":" + port;
 
         try {
             // Se existe uma conexão anterior, desconectar
