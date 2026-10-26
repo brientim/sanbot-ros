@@ -172,6 +172,15 @@
                 android:textSize="14sp" />
 
             <Switch
+                android:id="@+id/switchWsControl"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:checked="true"
+                android:text="WS control :8080"
+                android:textSize="14sp" />
+
+            <Switch
                 android:id="@+id/switchTtsType"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -205,9 +214,17 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="4dp"
-                android:checked="true"
+                android:checked="false"
                 android:text="Show Logs"
                 android:textSize="14sp" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:text="Suggested: leave off for normal use (can make the app unresponsive). On-screen log is capped (~8k chars)."
+                android:textSize="11sp"
+                android:textColor="#FF666666" />
 
             <TextView
                 android:layout_width="match_parent"
