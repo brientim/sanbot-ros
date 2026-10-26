@@ -52,4 +52,4 @@ OpenSDK `showEmotion` → MCU expression (not `FACE_IMAGE` JPEG load). Visible o
 | `/emotion` | **Partially tested** | MQTT + MainService cmd **1091** OK; visible only on face screen. |
 | `/autonomy` **wander** | **Tested** | Starts; stops on floor joint / obstacle (expected). |
 | `/autonomy` **dock** / charge | **Not physically tested** | MQTT/cmd **785** + `changebattery` lock OK; no end-to-end run to the charging pile. |
-| `/autonomy` **follow** | **Untested end-to-end** | MQTT/cmd **849** ACKs, but person-follow needs **`com.qihan.HumanFollow`** installed on the target Sanbot. We could **not obtain or find a copy** of that APK. Wired in the bridge; blocked on missing stock app. |
+| `/autonomy` **follow** | **Face-follow replacement** | Stock Qihan APK not found. Use `~/Developer/SanbotHumanFollow` (package **`com.qihan.HumanFollow`**). Bridge launches it on follow enable. Face-bbox track only. |

@@ -884,6 +884,16 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
                     break;
                 case "follow":
                     modularMotionManager.switchFollow(enabled);
+                    try {
+                        android.content.Intent followIntent = new android.content.Intent();
+                        followIntent.setClassName("com.qihan.HumanFollow",
+                                "com.qihan.HumanFollow.HumanFollowActivity");
+                        followIntent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+                        followIntent.putExtra("follow", enabled);
+                        startActivity(followIntent);
+                    } catch (Exception launchEx) {
+                        Log.w("MQTT", "HumanFollow app not installed or failed to launch", launchEx);
+                    }
                     break;
                 default:
                     Log.w("MQTT", "Unknown autonomy mode: " + mode);
