@@ -155,7 +155,7 @@ Below is a quick reference of the MQTT topics and RTMP transmission to understoo
 Notes
 * Optional fields may be omitted.
 * Angles are integers in **degrees**; speeds are percentages `0-100`.
-* Nano MainService quirks, emotion visibility, and `/autonomy` live test status (wander tested; dock/charge not physically tested; follow needs missing `com.qihan.HumanFollow`): see [docs/MQTT_CONTROL_ENHANCEMENTS.md](docs/MQTT_CONTROL_ENHANCEMENTS.md).
+* Nano MainService quirks, emotion visibility, and `/autonomy` live test status (wander tested; dock/charge not physically tested; follow uses in-repo [`Sanbot_HumanFollow/`](../Sanbot_HumanFollow/)): see [docs/MQTT_CONTROL_ENHANCEMENTS.md](docs/MQTT_CONTROL_ENHANCEMENTS.md).
 
 ### 2. Robot → ROS (App publishes)
 | MQTT topic | Content | Example payload |

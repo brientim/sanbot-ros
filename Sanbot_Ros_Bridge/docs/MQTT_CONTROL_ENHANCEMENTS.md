@@ -42,7 +42,19 @@ OpenSDK `showEmotion` → MCU expression (not `FACE_IMAGE` JPEG load). Visible o
 
 `charge` / `auto_charge` / `dock` → `switchCharge`  
 `wander` → `switchWander`  
-`follow` → `switchFollow`
+`follow` → launches in-repo face-follow app **`Sanbot_HumanFollow/`** (package **`com.qihan.HumanFollow`**). Build/install that APK; bridge notifies it via `SET_FOLLOWING` / `SET_SPEECH_FEEDBACK` (does not call `switchFollow(true)` — that arms onboard cruise).  
+
+Follow speech mute:
+
+```json
+{"mode":"follow","speech_feedback":false}
+```
+
+Combined:
+
+```json
+{"mode":"follow","enabled":true,"speech_feedback":true}
+```
 
 ## Live test status (Sanbot Nano, Oct 2026)
 
@@ -52,4 +64,4 @@ OpenSDK `showEmotion` → MCU expression (not `FACE_IMAGE` JPEG load). Visible o
 | `/emotion` | **Partially tested** | MQTT + MainService cmd **1091** OK; visible only on face screen. |
 | `/autonomy` **wander** | **Tested** | Starts; stops on floor joint / obstacle (expected). |
 | `/autonomy` **dock** / charge | **Not physically tested** | MQTT/cmd **785** + `changebattery` lock OK; no end-to-end run to the charging pile. |
-| `/autonomy` **follow** | **Face-follow replacement** | Stock Qihan APK not found. Use `~/Developer/SanbotHumanFollow` (package **`com.qihan.HumanFollow`**). Bridge launches it on follow enable. Face-bbox track only. |
+| `/autonomy` **follow** | **Face-follow stand-in** | Stock Qihan APK not found. Install **`Sanbot_HumanFollow/`** (`com.qihan.HumanFollow`). Face-bbox track only — not Orbbec body follow. |

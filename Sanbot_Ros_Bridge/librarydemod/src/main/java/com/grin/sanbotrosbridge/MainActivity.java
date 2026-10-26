@@ -427,7 +427,8 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
             public void onObstacleStatus(boolean status) {
                 try{
                     JSONObject json = new JSONObject();
-                    json.put("status", 1);
+                    // Must publish the real flag — hard-coding 1 stuck My Sanbot on BLOCKED forever.
+                    json.put("status", status ? 1 : 0);
                     mqttHandler.publishMessage(getPrefixedTopic("obstacle"), json.toString());
                 } catch (Exception e) {
                     e.printStackTrace();
@@ -555,6 +556,8 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
             handleEmotionControl(message);
         } else if (getPrefixedTopic("autonomy").equals(topic)) {
             handleAutonomyControl(message);
+        } else if (getPrefixedTopic("system").equals(topic)) {
+            handleSystemControl(message);
         } else if (getPrefixedTopic("speak").equals(topic)) {
             try {
                 JSONObject json = new JSONObject(message);
@@ -864,35 +867,43 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
     /**
      * Autonomy helpers. MQTT /autonomy:
      * {"mode":"charge|wander|follow","enabled":true}
+     * Follow speech mute (HumanFollow): {"mode":"follow","speech_feedback":false}
+     * Combined: {"mode":"follow","enabled":true,"speech_feedback":true}
      */
     private void handleAutonomyControl(String message) {
         try {
-            if (modularMotionManager == null) {
-                return;
-            }
             JSONObject json = new JSONObject(message);
             String mode = json.optString("mode", "").trim().toLowerCase();
+            boolean hasEnabled = json.has("enabled");
             boolean enabled = json.optBoolean("enabled", true);
+            boolean hasSpeech = json.has("speech_feedback") || json.has("speech");
+            boolean speechFeedback = json.has("speech_feedback")
+                    ? json.optBoolean("speech_feedback", true)
+                    : json.optBoolean("speech", true);
             switch (mode) {
                 case "charge":
                 case "auto_charge":
                 case "dock":
-                    modularMotionManager.switchCharge(enabled);
+                    if (hasEnabled && modularMotionManager != null) {
+                        modularMotionManager.switchCharge(enabled);
+                    }
                     break;
                 case "wander":
-                    modularMotionManager.switchWander(enabled);
+                    if (hasEnabled && modularMotionManager != null) {
+                        modularMotionManager.switchWander(enabled);
+                    }
                     break;
                 case "follow":
-                    modularMotionManager.switchFollow(enabled);
-                    try {
-                        android.content.Intent followIntent = new android.content.Intent();
-                        followIntent.setClassName("com.qihan.HumanFollow",
-                                "com.qihan.HumanFollow.HumanFollowActivity");
-                        followIntent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
-                        followIntent.putExtra("follow", enabled);
-                        startActivity(followIntent);
-                    } catch (Exception launchEx) {
-                        Log.w("MQTT", "HumanFollow app not installed or failed to launch", launchEx);
+                    // HumanFollow owns chase. Do NOT call switchFollow(true): MainService
+                    // re-launches without follow=true (preview-only) and arms onboard cruise
+                    // that looks like wander. Only clear the flag on off.
+                    if (hasEnabled || hasSpeech) {
+                        notifyHumanFollow(
+                                hasEnabled ? Boolean.valueOf(enabled) : null,
+                                hasSpeech ? Boolean.valueOf(speechFeedback) : null);
+                    }
+                    if (hasEnabled && !enabled && modularMotionManager != null) {
+                        modularMotionManager.switchFollow(false);
                     }
                     break;
                 default:
@@ -902,6 +913,88 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
         } catch (Exception e) {
             e.printStackTrace();
         }
+    }
+
+    /**
+     * Device helpers. MQTT /system:
+     * {"action":"reboot"}  (alias: "restart")
+     */
+    private void handleSystemControl(String message) {
+        try {
+            JSONObject json = new JSONObject(message);
+            String action = json.optString("action", json.optString("cmd", "")).trim().toLowerCase();
+            if ("reboot".equals(action) || "restart".equals(action)) {
+                appendMessage("MQTT: rebooting robot…");
+                Log.i("MQTT", "system reboot requested");
+                new Thread(() -> {
+                    try {
+                        Thread.sleep(800L);
+                    } catch (InterruptedException ignored) {
+                        Thread.currentThread().interrupt();
+                    }
+                    requestDeviceReboot();
+                }, "mqtt-reboot").start();
+            } else {
+                Log.w("MQTT", "Unknown system action: " + action);
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void requestDeviceReboot() {
+        try {
+            android.os.PowerManager pm =
+                    (android.os.PowerManager) getSystemService(POWER_SERVICE);
+            if (pm != null) {
+                pm.reboot(null);
+                return;
+            }
+        } catch (Throwable t) {
+            Log.w("MQTT", "PowerManager.reboot unavailable", t);
+        }
+        try {
+            Runtime.getRuntime().exec(new String[]{"/system/bin/reboot"});
+        } catch (Exception e) {
+            Log.e("MQTT", "/system/bin/reboot failed", e);
+            try {
+                Runtime.getRuntime().exec(new String[]{"reboot"});
+            } catch (Exception e2) {
+                Log.e("MQTT", "reboot failed", e2);
+            }
+        }
+    }
+
+    /**
+     * Launch / update {@code com.qihan.HumanFollow}. Pass null to leave follow or speech unchanged.
+     */
+    private void notifyHumanFollow(Boolean followEnabled, Boolean speechFeedback) {
+        runOnUiThread(() -> {
+            try {
+                Log.i("MQTT", "notify HumanFollow follow=" + followEnabled
+                        + " speech=" + speechFeedback);
+                if (followEnabled != null) {
+                    android.content.Intent followBroadcast = new android.content.Intent(
+                            "com.qihan.HumanFollow.SET_FOLLOWING");
+                    followBroadcast.setPackage("com.qihan.HumanFollow");
+                    followBroadcast.putExtra("enabled", followEnabled.booleanValue());
+                    followBroadcast.putExtra("follow", followEnabled.booleanValue());
+                    if (speechFeedback != null) {
+                        followBroadcast.putExtra("speech_feedback",
+                                speechFeedback.booleanValue());
+                    }
+                    sendBroadcast(followBroadcast);
+                } else if (speechFeedback != null) {
+                    android.content.Intent broadcast = new android.content.Intent(
+                            "com.qihan.HumanFollow.SET_SPEECH_FEEDBACK");
+                    broadcast.setPackage("com.qihan.HumanFollow");
+                    broadcast.putExtra("speech_feedback", speechFeedback.booleanValue());
+                    sendBroadcast(broadcast);
+                }
+            } catch (Exception launchEx) {
+                Log.w("MQTT", "HumanFollow notify failed", launchEx);
+            }
+        });
     }
 
     private void handleLedControl(String message) {
@@ -981,7 +1074,7 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
 
     private void subscribeToAllTopics() {
         String[] suffixes = new String[]{
-                "light", "move", "joints", "led", "speak", "emotion", "autonomy",
+                "light", "move", "joints", "led", "speak", "emotion", "autonomy", "system",
                 "ir", "battery", "touch", "pir", "voice_angle", "info", "obstacle", "imu", "speech"
         };
         java.util.List<String> spinnerItems = new java.util.ArrayList<>();
