@@ -32,11 +32,11 @@ final class LocalPersonScanner {
     }
 
     private static final String TAG = "HumanFollow-person";
-    private static final long MIN_SCAN_INTERVAL_MS = 280L;
+    private static final long MIN_SCAN_INTERVAL_MS = 220L;
     private static final int MAX_FACES = 4;
-    /** FaceDetector is weak above ~VGA; scan a downscaled RGB_565 copy. */
-    private static final int FACE_SCAN_MAX_W = 480;
-    private static final float FACE_CONFIDENCE_MIN = 0.28f;
+    /** FaceDetector is weak above ~VGA; try a couple of downscales. */
+    private static final int[] FACE_SCAN_WIDTHS = {480, 320, 640};
+    private static final float FACE_CONFIDENCE_MIN = 0.20f;
     private static final int MOTION_W = 160;
     private static final int MOTION_H = 90;
     private static final long SCAN_LOG_INTERVAL_MS = 2000L;
@@ -219,14 +219,24 @@ final class LocalPersonScanner {
 
     private List<TrackTarget> findFaces(Bitmap rgb) {
         List<TrackTarget> out = new ArrayList<>();
+        for (int targetW : FACE_SCAN_WIDTHS) {
+            addFacesAtWidth(rgb, targetW, out);
+            if (!out.isEmpty()) {
+                break;
+            }
+        }
+        return out;
+    }
+
+    private void addFacesAtWidth(Bitmap rgb, int targetW, List<TrackTarget> out) {
         int srcW = rgb.getWidth();
         int srcH = rgb.getHeight();
-        int bw = Math.min(FACE_SCAN_MAX_W, srcW);
+        int bw = Math.min(targetW, srcW);
         if ((bw & 1) == 1) {
             bw -= 1;
         }
-        if (bw < 2) {
-            return out;
+        if (bw < 64) {
+            return;
         }
         int bh = Math.max(2, (int) (srcH * (bw / (float) srcW)));
         if ((bh & 1) == 1) {
@@ -235,18 +245,15 @@ final class LocalPersonScanner {
         Bitmap scaled = null;
         Bitmap work = null;
         try {
-            if (bw != srcW || rgb.getConfig() != Bitmap.Config.RGB_565) {
-                scaled = Bitmap.createScaledBitmap(rgb, bw, bh, true);
-                work = scaled.getConfig() == Bitmap.Config.RGB_565
-                        ? scaled
-                        : scaled.copy(Bitmap.Config.RGB_565, false);
-                if (work != scaled) {
-                    scaled.recycle();
-                    scaled = null;
-                }
-            } else {
-                work = rgb;
+            scaled = Bitmap.createScaledBitmap(rgb, bw, bh, true);
+            work = scaled.getConfig() == Bitmap.Config.RGB_565
+                    ? scaled.copy(Bitmap.Config.RGB_565, true)
+                    : scaled.copy(Bitmap.Config.RGB_565, true);
+            if (work != scaled) {
+                scaled.recycle();
+                scaled = null;
             }
+            boostContrastRgb565(work);
             FaceDetector detector = new FaceDetector(work.getWidth(), work.getHeight(), MAX_FACES);
             FaceDetector.Face[] found = new FaceDetector.Face[MAX_FACES];
             int n = detector.findFaces(work, found);
@@ -272,14 +279,46 @@ final class LocalPersonScanner {
                         "FACE"));
             }
         } finally {
-            if (work != null && work != rgb) {
+            if (work != null) {
                 work.recycle();
             }
-            if (scaled != null && scaled != work && scaled != rgb) {
+            if (scaled != null && scaled != work) {
                 scaled.recycle();
             }
         }
-        return out;
+    }
+
+    /** Mild contrast stretch — FaceDetector is sensitive to flat indoor lighting. */
+    private static void boostContrastRgb565(Bitmap rgb565) {
+        if (rgb565 == null || rgb565.getConfig() != Bitmap.Config.RGB_565) {
+            return;
+        }
+        int w = rgb565.getWidth();
+        int h = rgb565.getHeight();
+        int[] pixels = new int[w * h];
+        rgb565.getPixels(pixels, 0, w, 0, 0, w, h);
+        int min = 255;
+        int max = 0;
+        for (int p : pixels) {
+            int y = (((p >> 16) & 0xff) * 30 + ((p >> 8) & 0xff) * 59 + (p & 0xff) * 11) / 100;
+            if (y < min) min = y;
+            if (y > max) max = y;
+        }
+        int span = Math.max(32, max - min);
+        if (span >= 200) {
+            return;
+        }
+        for (int i = 0; i < pixels.length; i++) {
+            int p = pixels[i];
+            int r = (p >> 16) & 0xff;
+            int g = (p >> 8) & 0xff;
+            int b = p & 0xff;
+            r = Math.min(255, Math.max(0, (r - min) * 255 / span));
+            g = Math.min(255, Math.max(0, (g - min) * 255 / span));
+            b = Math.min(255, Math.max(0, (b - min) * 255 / span));
+            pixels[i] = 0xff000000 | (r << 16) | (g << 8) | b;
+        }
+        rgb565.setPixels(pixels, 0, w, 0, 0, w, h);
     }
 
     /** Update prevGray frame; returns gray buffer (caller must not mutate after next call). */
@@ -404,16 +443,16 @@ final class LocalPersonScanner {
         }
         prevGray = gray;
 
-        if (hits < 120) {
+        if (hits < 90) {
             return null;
         }
         float bw = (maxX - minX + 1f) / MOTION_W;
         float bh = (maxY - minY + 1f) / MOTION_H;
-        // Stricter person-ish: reject wall-sized / full-frame ego-motion flashes
-        if (bh < 0.22f || bw < 0.10f || bw > 0.55f || bh > 0.75f) {
+        // Person-ish upright blob; reject wall-sized / full-frame ego-motion flashes
+        if (bh < 0.18f || bw < 0.08f || bw > 0.60f || bh > 0.80f) {
             return null;
         }
-        if (bh < bw * 1.05f) {
+        if (bh < bw * 0.95f) {
             // Prefer upright (taller than wide)
             return null;
         }
@@ -530,7 +569,7 @@ final class LocalPersonScanner {
         byte[] nv21 = yuv420ToNv21(image);
         YuvImage yuv = new YuvImage(nv21, ImageFormat.NV21, image.getWidth(), height, null);
         ByteArrayOutputStream out = new ByteArrayOutputStream();
-        yuv.compressToJpeg(new Rect(0, 0, width, height), 65, out);
+        yuv.compressToJpeg(new Rect(0, 0, width, height), 90, out);
         byte[] jpeg = out.toByteArray();
         Bitmap full = android.graphics.BitmapFactory.decodeByteArray(jpeg, 0, jpeg.length);
         if (full == null) {

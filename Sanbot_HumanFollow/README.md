@@ -7,13 +7,13 @@ This is **not** Qihan’s original APK. It uses OpenSDK **face recognition** box
 ## Behaviour
 
 - Package id: **`com.qihan.HumanFollow`** (matches MainService voice / launch intents).
-- Side-by-side **HD camera preview** + **IR radar**. Tracks **person** (face→body box + motion blob); sticky teal **LOCK** holds briefly through misses.
+- Side-by-side **HD camera preview** + **IR radar**. Tracks **person** (face→body box + motion blob); sticky teal **LOCK** holds through FaceDetector flicker (~5.5 s follow / ~7 s detect-test).
 - Follow uses **continuous** wheel keep (`LEFT_FORWARD` / `FORWARD` / …). Stand-off uses **face height**.
-- Chase is **face-only**; motion blobs are search hints (not drive targets).
+- Chase is **face-only**; motion blobs are search hints (not drive targets). Detect-test may show motion for sticky UI only.
 - On follow, head poses **pan center (90°)** and **tilt mid–high** and re-centers periodically.
 - **Accessibility gesture:** raise an open hand above your face to **start/stop** follow.
 - **Voice control** (after wake): “follow me” / “stop follow” / “speech on|off” / “status”.
-- **Speech feedback** (on-screen or MQTT `speech_feedback`): status phrases at **50% speed / 50% volume**.
+- **Speech feedback** (on-screen or MQTT `speech_feedback`): status phrases at **50% speed / 50% volume**. Detect-test avoids TTS storms (no “No human” / “Detect on” chatter).
 - Listens for stock broadcasts:
   - `com.qinhancloud.humanfollow.open` / `.close` (ObstacleManager typo)
   - `com.qihancloud.obstacle.humanfollow.open` / `.close`

@@ -82,9 +82,14 @@ public class HumanFollowActivity extends TopBaseActivity implements SurfaceHolde
     private static final double RANGE_TOO_CLOSE = 0.34;
     private static final double RANGE_TOO_FAR = 0.09;
     private static final long CMD_INTERVAL_MS = 220L;
-    /** Hold face lock briefly through misses — short so we don't chase stale boxes. */
-    private static final long LOCK_HOLD_MS = 1600L;
-    private static final long TARGET_LOST_MS = 2800L;
+    /**
+     * Sticky lock through FaceDetector flicker. Android FaceDetector often drops
+     * for 1–2 s even when a person is still in frame.
+     */
+    private static final long LOCK_HOLD_MS = 5500L;
+    /** Detect-test hold — longer so UI does not flap Human detected / No human. */
+    private static final long DETECT_LOCK_HOLD_MS = 7000L;
+    private static final long TARGET_LOST_MS = 9000L;
     /** Hard stop (furniture / crash) — well inside normal follow stand-off. */
     private static final int IR_CRASH_CM = 12;
     /**
@@ -167,9 +172,15 @@ public class HumanFollowActivity extends TopBaseActivity implements SurfaceHolde
             }
             long age = System.currentTimeMillis() - lastTargetAt;
             if (age > TARGET_LOST_MS) {
+                boolean firstLost = lockedTarget != null;
                 lockedTarget = null;
-                setStatus(getString(R.string.status_searching),
-                        getString(R.string.speak_searching));
+                // Speak Searching once when lock drops — not every watchdog tick.
+                if (firstLost) {
+                    setStatus(getString(R.string.status_searching),
+                            getString(R.string.speak_searching));
+                } else {
+                    setStatus(getString(R.string.status_searching));
+                }
                 faceOverlay.clearFaces();
                 stopWheels();
                 // Search turn OK unless something is crash-close
@@ -587,16 +598,20 @@ public class HumanFollowActivity extends TopBaseActivity implements SurfaceHolde
             handleRaisedHandGesture();
         }
 
-        // Drive / lock only on faces (SDK or local). Motion blobs ≠ people when the robot moves.
+        // Follow drive: face lock only. Detect test: face preferred, motion OK for sticky UI.
         TrackTarget best = pickFaceLock(targets, lockedTarget);
         TrackTarget motionHint = pickMotionHint(targets);
+        if (best == null && detecting && !following && motionHint != null) {
+            best = motionHint;
+        }
         long now = System.currentTimeMillis();
+        long holdMs = detecting && !following ? DETECT_LOCK_HOLD_MS : LOCK_HOLD_MS;
 
         if (best != null) {
             lockedTarget = best;
             lastTargetAt = now;
-        } else if (lockedTarget != null && isFaceDerived(lockedTarget)
-                && now - lastTargetAt <= LOCK_HOLD_MS) {
+        } else if (lockedTarget != null && now - lastTargetAt <= holdMs
+                && (detecting || isFaceDerived(lockedTarget))) {
             best = lockedTarget;
         } else {
             lockedTarget = null;
@@ -607,6 +622,7 @@ public class HumanFollowActivity extends TopBaseActivity implements SurfaceHolde
         final TrackTarget lock = lockedTarget;
         final TrackTarget drive = best;
         final TrackTarget hint = motionHint;
+        final boolean lockedIsFace = isFaceDerived(lock);
         runOnUiThread(() -> {
             faceOverlay.setTargets(copy, lock != null ? lock : hint);
             if (lock != null) {
@@ -616,13 +632,11 @@ public class HumanFollowActivity extends TopBaseActivity implements SurfaceHolde
                     applyDetectStatus(true);
                 }
                 debugText.setText(String.format(Locale.US,
-                        "FACE lock cx=%.2f rh=%.2f dets=%d %s",
+                        "%s lock cx=%.2f rh=%.2f dets=%d %s",
+                        lockedIsFace ? "FACE" : "HUMAN",
                         lock.centerX(), lock.rangeHeight, copy.size(),
                         following ? "FOLLOW" : (detecting ? "DETECT" : "preview")));
             } else if (hint != null) {
-                if (detecting && !following) {
-                    applyDetectStatus(false);
-                }
                 debugText.setText(String.format(Locale.US,
                         "motion hint cx=%.2f (need face) %s",
                         hint.centerX(),
@@ -644,7 +658,8 @@ public class HumanFollowActivity extends TopBaseActivity implements SurfaceHolde
         if (!following) {
             return;
         }
-        if (drive != null) {
+        // Drive only on face-derived lock — never chase a motion blob.
+        if (drive != null && isFaceDerived(drive)) {
             onPerson(drive);
         } else if (hint != null && !isCrashClose()) {
             // No face yet: turn toward motion only — never drive straight at furniture.
@@ -958,7 +973,7 @@ public class HumanFollowActivity extends TopBaseActivity implements SurfaceHolde
             lockedTarget = null;
         }
         mainHandler.removeCallbacks(lostTargetWatchdog);
-        setFaceTrack(enabled);
+        setFaceTrack(enabled || detecting);
         if (!enabled) {
             stopWheels();
             runOnUiThread(() -> {
@@ -1002,14 +1017,14 @@ public class HumanFollowActivity extends TopBaseActivity implements SurfaceHolde
             setFollowing(false, false);
         }
         detecting = enabled;
+        setFaceTrack(enabled || following);
         if (!enabled) {
             lastDetectHadHuman = false;
+            lockedTarget = null;
             runOnUiThread(() -> {
                 if (!following) {
-                    if (announce) {
-                        setStatus(getString(R.string.status_idle),
-                                getString(R.string.speak_detect_off));
-                    } else if (statusText != null) {
+                    // Detect mode: UI only — no TTS (saves CPU / avoids announcement storms).
+                    if (statusText != null) {
                         statusText.setText(R.string.status_idle);
                     }
                     if (debugText != null) {
@@ -1025,13 +1040,10 @@ public class HumanFollowActivity extends TopBaseActivity implements SurfaceHolde
         }
         poseHeadForFollowCamera();
         lastDetectAnnounceAt = 0L;
+        lastDetectHadHuman = false;
         runOnUiThread(() -> {
-            if (announce) {
-                setStatus(getString(R.string.status_detecting),
-                        getString(R.string.speak_detect_on));
-            } else {
-                setStatus(getString(R.string.status_detecting));
-            }
+            // No "Detect on" TTS — status text is enough for the test mode.
+            setStatus(getString(R.string.status_detecting));
             if (debugText != null) {
                 debugText.setText("detect test — face the camera");
             }
@@ -1039,24 +1051,27 @@ public class HumanFollowActivity extends TopBaseActivity implements SurfaceHolde
         Log.i(TAG, "detect enabled (no drive)");
     }
 
+    /**
+     * Detect-test voice: only announce a positive lock once.
+     * Never TTS "No human" — FaceDetector flicker made that a speech storm.
+     */
     private void applyDetectStatus(boolean humanSeen) {
-        long now = System.currentTimeMillis();
-        if (humanSeen == lastDetectHadHuman && now - lastDetectAnnounceAt < 2500L) {
-            if (humanSeen) {
-                statusText.setText(R.string.status_human_seen);
-            } else {
-                statusText.setText(R.string.status_no_human);
-            }
+        if (statusText == null) {
+            return;
+        }
+        if (humanSeen == lastDetectHadHuman) {
+            statusText.setText(humanSeen
+                    ? R.string.status_human_seen
+                    : R.string.status_no_human);
             return;
         }
         lastDetectHadHuman = humanSeen;
-        lastDetectAnnounceAt = now;
+        lastDetectAnnounceAt = System.currentTimeMillis();
         if (humanSeen) {
             setStatus(getString(R.string.status_human_seen),
                     getString(R.string.speak_human_seen));
         } else {
-            setStatus(getString(R.string.status_no_human),
-                    getString(R.string.speak_no_human));
+            setStatus(getString(R.string.status_no_human));
         }
     }
 
