@@ -107,6 +107,9 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
 
     private final Map<Integer, Long> lastIRUpdate = new HashMap<>();
     private static final long IR_UPDATE_INTERVAL_MS = 1000;  // 1 segundo por sensor
+    private long lastImuPublishMs = 0;
+    private static final long IMU_UPDATE_INTERVAL_MS = 200; // 5 Hz — unthrottled gyro ANRs the UI
+    private static final int MAX_LOG_CHARS = 8000;
 
     private TextToSpeech tts;
 
@@ -519,6 +522,11 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
         hardWareManager.setOnHareWareListener(new GyroscopeListener() {
             @Override
             public void gyroscopeData(float x, float y, float z) {
+                long now = System.currentTimeMillis();
+                if (now - lastImuPublishMs < IMU_UPDATE_INTERVAL_MS) {
+                    return;
+                }
+                lastImuPublishMs = now;
                 try {
                     JSONObject gyroJson = new JSONObject();
                     gyroJson.put("x", x);
@@ -618,11 +626,14 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
         final String finalTopic = topic;
         final String finalMessage = message;
 
-        runOnUiThread(() -> {
-            if ("All".equals(selectedTopic) || selectedTopic.equals(finalTopic)) {
-                appendMessage("[" + finalTopic + "]: " + finalMessage);
-            }
-        });
+        // Never mirror high-rate telemetry into the on-screen log (ANR risk).
+        if (!isTelemetryTopic(finalTopic)) {
+            runOnUiThread(() -> {
+                if ("All".equals(selectedTopic) || selectedTopic.equals(finalTopic)) {
+                    appendMessage("[" + finalTopic + "]: " + finalMessage);
+                }
+            });
+        }
 
         if (getPrefixedTopic("light").equals(topic)) {
             handleLightControl(message);
@@ -891,7 +902,9 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
     public void onTopicsUpdated(java.util.List<String> topics) {}
 
     private void subscribeToAllTopics() {
-        String[] suffixes = new String[]{"light", "move", "joints", "led", "speak", "ir", "battery", "touch", "pir", "voice_angle", "info", "obstacle", "imu", "speech"};
+        // Commands only — do not subscribe to outbound telemetry (ir/imu/battery/…).
+        // Subscribing + Show Logs caused unbounded TextView growth and ANRs.
+        String[] suffixes = new String[]{"light", "move", "joints", "led", "speak"};
         java.util.List<String> spinnerItems = new java.util.ArrayList<>();
         spinnerItems.add("All");
 
@@ -906,10 +919,29 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
         spinnerTopics.setAdapter(adapter);
     }
 
+    private boolean isTelemetryTopic(String topic) {
+        if (topic == null) return false;
+        return topic.equals(getPrefixedTopic("ir"))
+                || topic.equals(getPrefixedTopic("imu"))
+                || topic.equals(getPrefixedTopic("battery"))
+                || topic.equals(getPrefixedTopic("info"))
+                || topic.equals(getPrefixedTopic("touch"))
+                || topic.equals(getPrefixedTopic("pir"))
+                || topic.equals(getPrefixedTopic("voice_angle"))
+                || topic.equals(getPrefixedTopic("obstacle"))
+                || topic.equals(getPrefixedTopic("speech"));
+    }
+
     private void appendMessage(String msg) {
-        if (checkBoxShowLogs != null && checkBoxShowLogs.isChecked()) {
+        if (checkBoxShowLogs != null && checkBoxShowLogs.isChecked() && textViewMessages != null) {
             textViewMessages.append(msg + "\n");
-            scrollView.post(() -> scrollView.fullScroll(View.FOCUS_DOWN));
+            CharSequence text = textViewMessages.getText();
+            if (text != null && text.length() > MAX_LOG_CHARS) {
+                textViewMessages.setText(text.subSequence(text.length() - MAX_LOG_CHARS, text.length()));
+            }
+            if (scrollView != null) {
+                scrollView.post(() -> scrollView.fullScroll(View.FOCUS_DOWN));
+            }
         }
     }
 
@@ -1041,6 +1073,7 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
                         json.put("main_service_version", systemManager.getMainServiceVersion());
                         json.put("android_version", android.os.Build.VERSION.RELEASE);
                         json.put("device_model", android.os.Build.MODEL);
+                        putVolumeTelemetry(json);
 
                         mqttHandler.publishMessage(getPrefixedTopic("info"), json.toString());
                     } catch (Exception e) {
@@ -1051,6 +1084,60 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
                 publishHandler.postDelayed(this, 5000); // repete a cada 5 segundos
             }
         }, 5000);
+    }
+
+    /** Android media/system levels + Qihan speak volume for My Sanbot Robot Info. */
+    private void putVolumeTelemetry(JSONObject json) {
+        try {
+            android.media.AudioManager am =
+                    (android.media.AudioManager) getSystemService(AUDIO_SERVICE);
+            if (am != null) {
+                int musicMax = Math.max(1, am.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC));
+                int music = am.getStreamVolume(android.media.AudioManager.STREAM_MUSIC);
+                int systemMax = Math.max(1, am.getStreamMaxVolume(android.media.AudioManager.STREAM_SYSTEM));
+                int system = am.getStreamVolume(android.media.AudioManager.STREAM_SYSTEM);
+                json.put("volume_music", music);
+                json.put("volume_music_max", musicMax);
+                json.put("volume_music_pct", (music * 100) / musicMax);
+                json.put("volume_system", system);
+                json.put("volume_system_max", systemMax);
+                json.put("volume_system_pct", (system * 100) / systemMax);
+            }
+            int mute = android.provider.Settings.System.getInt(
+                    getContentResolver(), "volume_master_mute", 0);
+            json.put("master_mute", mute != 0);
+            Integer speakVol = readQihanSettingInt("robot_speak_volume");
+            if (speakVol != null) {
+                json.put("robot_speak_volume", speakVol);
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    private Integer readQihanSettingInt(String key) {
+        android.database.Cursor cursor = null;
+        try {
+            android.net.Uri uri = android.net.Uri.parse(
+                    "content://com.qihancloud.setting.Provider/setting");
+            cursor = getContentResolver().query(
+                    uri, new String[]{"key", "value"}, "key=?", new String[]{key}, null);
+            if (cursor != null && cursor.moveToFirst()) {
+                int idx = cursor.getColumnIndex("value");
+                if (idx >= 0) {
+                    String raw = cursor.getString(idx);
+                    if (raw != null && !raw.isEmpty()) {
+                        return Integer.parseInt(raw.trim());
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        } finally {
+            if (cursor != null) {
+                cursor.close();
+            }
+        }
+        return null;
     }
 
     private void publishSpeechToMqtt(String texto) {
