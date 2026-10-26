@@ -65,6 +65,9 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
     private EditText editTextPort;
     private Button buttonConnect;
     private Button buttonClear;
+    private Button buttonClose;
+    private Button buttonCloseBottom;
+    private TextView textViewVersion;
     private Spinner spinnerTopics;
     private TextView textViewMessages;
     private ScrollView scrollView;
@@ -136,6 +139,13 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
         editTextPort = findViewById(R.id.editTextPort);
         buttonConnect = findViewById(R.id.buttonConnect);
         buttonClear = findViewById(R.id.buttonClear);
+        buttonClose = findViewById(R.id.buttonClose);
+        buttonCloseBottom = findViewById(R.id.buttonCloseBottom);
+        textViewVersion = findViewById(R.id.textViewVersion);
+        if (textViewVersion != null) {
+            textViewVersion.setText(String.format(Locale.US, "v%s (%d)",
+                    BuildConfig.VERSION_NAME, BuildConfig.VERSION_CODE));
+        }
         spinnerTopics = findViewById(R.id.spinnerTopics);
         textViewMessages = findViewById(R.id.textViewMessages);
         scrollView = findViewById(R.id.scrollView);
@@ -254,6 +264,13 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
         }
 
         buttonClear.setOnClickListener(v -> textViewMessages.setText(""));
+        View.OnClickListener closeClick = v -> exitBridgeUi();
+        if (buttonClose != null) {
+            buttonClose.setOnClickListener(closeClick);
+        }
+        if (buttonCloseBottom != null) {
+            buttonCloseBottom.setOnClickListener(closeClick);
+        }
 
         tts = new TextToSpeech(this, this);
         
@@ -946,6 +963,21 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
                 appendMessage("❌ Required permissions denied. RTMP streaming will not work.");
             }
         }
+    }
+
+    @Override
+    public void onBackPressed() {
+        // Nano has no nav bar; Close / Back dismisses the UI without killing MQTT.
+        exitBridgeUi();
+    }
+
+    /**
+     * Leave the config screen (boot / auto-open). Keeps the process (and MQTT) alive
+     * via {@link #moveTaskToBack(boolean)} instead of {@link #finish()}.
+     */
+    private void exitBridgeUi() {
+        Log.i("SanbotRosBridge", "Close — move bridge UI to background");
+        moveTaskToBack(true);
     }
 
     @Override

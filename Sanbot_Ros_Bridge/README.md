@@ -126,6 +126,7 @@ roslaunch sanbot_ros app_bridge.launch
      ```
    * In **MQTT Configuration**, set **IP Address** (and **Port** if not `1883`). **Namespace** is optional (empty → topics like `/battery`; `nano` → `/nano/battery`).
    * Tap **Connect**. Optionally leave **Auto-connect on launch** / **Auto-launch on boot** enabled so the app reconnects after reboot.
+   * **Close** (top or bottom) or Back dismisses the screen without disconnecting MQTT (Nano has no nav bar). HUD shows **`v{versionName} ({versionCode})`** — current **`v1.1.0 (2)`**.
    * Enable the RTMP camera stream with **RTMP ON/OFF**.
 
 ![MQTT Configuration UI on Sanbot Nano](assets/mqtt-configuration-new-features.jpg)
