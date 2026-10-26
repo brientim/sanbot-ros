@@ -147,12 +147,15 @@ Below is a quick reference of the MQTT topics and RTMP transmission to understoo
 | `ros/move` | Discrete movements and basic navigation | `{ "direction": string, "speed": int?, "distance": int?, "duration": int? }` | `{ "direction": "forward", "speed": 7, "duration": 2 }` |
 | `ros/light` | White forehead LED (brightness) | `{ "white": 0-3 }` | `{ "white": 2 }` |
 | `ros/led` | Color LEDs (head / hands) | `{ "part": string, "mode": string, "duration": int }` | `{ "part": "all_head", "mode": "blue", "duration": 5 }` |
-| `ros/joints` | Head & wing servos | `{ "joint": string, "angle": int°, "speed": int%? }` | `{ "joint": "head_pan", "angle": 45 }` |
+| `ros/joints` | Head & wing servos | `{ "joint": string, "angle": int°?, "speed": int%?, "action": string? }` | `{ "joint": "wing_left", "action": "up", "speed": 50 }` |
+| `ros/emotion` | Face expression | `{ "emotion": string }` | `{ "emotion": "smile" }` |
+| `ros/autonomy` | Dock / wander / follow | `{ "mode": string, "enabled": bool }` | `{ "mode": "wander", "enabled": true }` |
 | `ros/speak` | Text-to-Speech | `{ "msg": string }` | `{ "msg": "Hello, I am Sanbot" }` |
 
 Notes
 * Optional fields may be omitted.
 * Angles are integers in **degrees**; speeds are percentages `0-100`.
+* Nano MainService quirks, emotion visibility, and `/autonomy` live test status (wander tested; dock/charge not physically tested; follow needs missing `com.qihan.HumanFollow`): see [docs/MQTT_CONTROL_ENHANCEMENTS.md](docs/MQTT_CONTROL_ENHANCEMENTS.md).
 
 ### 2. Robot → ROS (App publishes)
 | MQTT topic | Content | Example payload |

@@ -1,0 +1,55 @@
+# MQTT control enhancements (wings / emotion / autonomy)
+
+## Topics
+
+### Wings — `/joints`
+
+```json
+{"joint":"wing_left","action":"up","speed":50}
+{"joint":"wing_right","action":"down","speed":50}
+{"joint":"wing_both","action":"stop","speed":50}
+```
+
+Actions: `up` / `raise` | `down` / `drop` | `stop` | `reset` | `wave`  
+Angle without action: **≥ 135 → raise**, else drop.
+
+**Nano MainService (`1.0.0_alexa_release`):** use hand Orders **547** (absolute raise), **546** (relative lower), **545** (no-angle stop). `CombinationHandMotion` / cmd **4374** is ACK’d and never reaches the MCU. Keep setting `robot_arm_action=true`.
+
+### Head pan — `/joints`
+
+```json
+{"joint":"head_pan","angle":90,"speed":50}
+```
+
+**Nano quirk:** MainService AbsoluteAngle `action` is motor axis (**1**=vertical, **2**=horizontal). Stock dsdk `ACTION_START` in `action` made pan behave as tilt. Bridge sends `(byte) 2` for pan.
+
+### Emotion — `/emotion`
+
+```json
+{"emotion":"smile"}
+```
+
+OpenSDK `showEmotion` → MCU expression (not `FACE_IMAGE` JPEG load). Visible on the **face screen**; Sanbot-ros UI foreground hides it.
+
+### Autonomy — `/autonomy`
+
+```json
+{"mode":"wander","enabled":true}
+{"mode":"wander","enabled":false}
+{"mode":"charge","enabled":true}
+{"mode":"follow","enabled":true}
+```
+
+`charge` / `auto_charge` / `dock` → `switchCharge`  
+`wander` → `switchWander`  
+`follow` → `switchFollow`
+
+## Live test status (Sanbot Nano, Oct 2026)
+
+| Topic / mode | Status | Notes |
+|--------------|--------|--------|
+| `/joints` pan + wings | **Tested** | Nano MainService quirks fixed (pan `action=2`, wings 545/546/547). |
+| `/emotion` | **Partially tested** | MQTT + MainService cmd **1091** OK; visible only on face screen. |
+| `/autonomy` **wander** | **Tested** | Starts; stops on floor joint / obstacle (expected). |
+| `/autonomy` **dock** / charge | **Not physically tested** | MQTT/cmd **785** + `changebattery` lock OK; no end-to-end run to the charging pile. |
+| `/autonomy` **follow** | **Untested end-to-end** | MQTT/cmd **849** ACKs, but person-follow needs **`com.qihan.HumanFollow`** installed on the target Sanbot. We could **not obtain or find a copy** of that APK. Wired in the bridge; blocked on missing stock app. |
