@@ -39,6 +39,9 @@ final class OrbbecNative {
     /** int[3] = { width, height, useColorFlag } */
     static native int[] nativeFrameSize();
 
-    /** Fill ARGB ints (length >= w*h). Returns 1 on success. */
+    /** Fill ARGB ints (length >= w*h). Returns 1 on success. Color if available, else depth-gray. */
     static native int nativeGrabArgb(int[] argb);
+
+    /** Always fill from depth map as grayscale ARGB (even when color session is open). */
+    static native int nativeGrabDepthArgb(int[] argb);
 }

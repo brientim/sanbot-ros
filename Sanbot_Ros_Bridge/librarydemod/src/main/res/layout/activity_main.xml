@@ -171,6 +171,15 @@
                 android:text="RTMP ON/OFF"
                 android:textSize="14sp" />
 
+            <Button
+                android:id="@+id/buttonHdSpike"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:minHeight="40dp"
+                android:text="HD spike stills"
+                android:textSize="13sp" />
+
             <Switch
                 android:id="@+id/switchWsControl"
                 android:layout_width="match_parent"

@@ -23,6 +23,7 @@ import com.sanbot.opensdk.beans.FuncConstant;
 import com.sanbot.opensdk.function.beans.SpeakOption;
 import com.sanbot.opensdk.function.beans.wheelmotion.NoAngleWheelMotion;
 import com.sanbot.opensdk.function.beans.wheelmotion.RelativeAngleWheelMotion;
+import com.sanbot.opensdk.function.unit.HDCameraManager;
 import com.sanbot.opensdk.function.unit.HardWareManager;
 import com.sanbot.opensdk.function.unit.SpeechManager;
 import com.sanbot.opensdk.function.unit.SystemManager;
@@ -53,12 +54,16 @@ import androidx.core.content.ContextCompat;
 import com.pedro.common.ConnectChecker;
 import com.pedro.library.generic.GenericStream;
 import com.pedro.encoder.input.sources.audio.MicrophoneSource;
+import com.pedro.encoder.input.sources.video.BufferVideoSource;
+import android.hardware.Camera;
+import android.graphics.ImageFormat;
+import android.graphics.SurfaceTexture;
 import android.view.SurfaceView;
 import android.view.SurfaceHolder;
 import android.text.Editable;
 import android.text.TextWatcher;
 
-public class MainActivity extends TopBaseActivity implements MqttHandler.MqttStatusListener, TextToSpeech.OnInitListener, ConnectChecker, ControlWebSocketServer.Listener, OrbbecBodyStreamer.Listener {
+public class MainActivity extends TopBaseActivity implements MqttHandler.MqttStatusListener, TextToSpeech.OnInitListener, ConnectChecker, ControlWebSocketServer.Listener, OrbbecBodyStreamer.Listener, HdCameraForeheadStreamer.Listener, UvcUsbStreamer.Listener {
 
     private EditText editTextName;
     private EditText editTextIp;
@@ -67,6 +72,7 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
     private Button buttonClear;
     private Button buttonClose;
     private Button buttonCloseBottom;
+    private Button buttonHdSpike;
     private TextView textViewVersion;
     private Spinner spinnerTopics;
     private TextView textViewMessages;
@@ -86,10 +92,12 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
     private boolean connected = false;
     private String selectedTopic = "All";
     private String robotName = "";
-    /** Preferred HLS path for My Sanbot (face|body). Head always publishes live/face; Orbbec → live/body. */
+    /** Preferred HLS path for My Sanbot (face|body|forehead|usb|depth). */
     private String cameraLivePath = "face";
     private ControlWebSocketServer controlWsServer;
     private OrbbecBodyStreamer orbbecBodyStreamer;
+    private HdCameraForeheadStreamer hdCameraForeheadStreamer;
+    private UvcUsbStreamer uvcUsbStreamer;
 
     private static final String PREFS_NAME = "mqtt_prefs";
     private static final String KEY_LAST_IP = "last_broker_ip";
@@ -107,6 +115,7 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
     private WheelMotionManager wheelMotionManager;
     private HeadMotionManager headMotionManager;
     private SpeechManager speechManager;
+    private HDCameraManager hdCameraManager;
 
 
     private Handler publishHandler = new Handler();
@@ -127,6 +136,9 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
 
     // === RTMP Streaming ===
     private GenericStream rtmpStream;
+    private BufferVideoSource faceBufferSource;
+    private Camera faceHalCamera;
+    private final Object faceCameraLock = new Object();
     private static final int STREAM_WIDTH = 1280;
     private static final int STREAM_HEIGHT = 720;
     private static final int VIDEO_BITRATE = 1500 * 1000; // 1.5 Mbps
@@ -193,8 +205,26 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
         cameraLivePath = prefs.getString(KEY_CAMERA_PATH, "face");
         orbbecBodyStreamer = new OrbbecBodyStreamer(this, this);
         orbbecBodyStreamer.register();
+        hdCameraForeheadStreamer = new HdCameraForeheadStreamer(this, this);
+        uvcUsbStreamer = new UvcUsbStreamer(this, this);
         String brokerForBody = editTextIp != null ? editTextIp.getText().toString().trim() : "";
-        orbbecBodyStreamer.setBrokerIp(brokerForBody.isEmpty() ? "192.168.1.4" : brokerForBody);
+        String brokerIp = brokerForBody.isEmpty() ? "192.168.1.4" : brokerForBody;
+        orbbecBodyStreamer.setBrokerIp(brokerIp);
+        hdCameraForeheadStreamer.setBrokerIp(brokerIp);
+        uvcUsbStreamer.setBrokerIp(brokerIp);
+        buttonHdSpike = findViewById(R.id.buttonHdSpike);
+        if (buttonHdSpike != null) {
+            buttonHdSpike.setOnClickListener(v -> {
+                if (switchRtmp != null && switchRtmp.isChecked()) {
+                    appendMessage("📷 HD spike: turn RTMP Off first (camera exclusive on Nano)");
+                    return;
+                }
+                appendMessage("📷 HD spike (MAIN/SUB + HAL face)…");
+                if (hdCameraForeheadStreamer != null) {
+                    hdCameraForeheadStreamer.runSpikeAsync(true);
+                }
+            });
+        }
         boolean wsControlOn = prefs.getBoolean(KEY_WS_CONTROL, true);
         if (switchWsControl != null) {
             switchWsControl.setChecked(wsControlOn);
@@ -378,7 +408,9 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
                 // Start streaming if permissions are granted, otherwise request
                 if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED ||
                         ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                    appendMessage("❌ RTMP: grant Camera + Mic, then toggle RTMP On again");
                     checkCameraPermissions();
+                    buttonView.setChecked(false);
                 } else {
                     if (rtmpStream == null || !rtmpStream.isStreaming()) {
                         // Show SurfaceView first, then init on next layout pass so the holder is valid.
@@ -478,6 +510,22 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
         headMotionManager.doAbsoluteAngleMotion(absoluteAngleHeadMotion);
         
         hardWareManager = (HardWareManager) getUnitManager(FuncConstant.HARDWARE_MANAGER);
+        try {
+            hdCameraManager = (HDCameraManager) getUnitManager(FuncConstant.HDCAMERA_MANAGER);
+            if (hdCameraForeheadStreamer != null) {
+                hdCameraForeheadStreamer.setHdCameraManager(hdCameraManager);
+            }
+            appendMessage(hdCameraManager != null
+                    ? "📷 HDCameraManager bound"
+                    : "⚠️ HDCameraManager null");
+        } catch (Exception e) {
+            appendMessage("⚠️ HDCameraManager: " + e.getMessage());
+        }
+        if (uvcUsbStreamer != null) {
+            uvcUsbStreamer.refreshAvailability();
+        }
+        // No auto HD spike — Nano camera HAL is single-client; spike races Face RTMP.
+        // Use the "HD spike stills" button with RTMP Off when needed.
 
         hardWareManager.setOnHareWareListener(
                 new TouchSensorListener() {
@@ -711,33 +759,41 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
             JSONObject json = new JSONObject(message);
             boolean touchedSource = json.has("source");
             boolean touchedRtmp = json.has("rtmp") || json.has("enabled") || json.has("streaming");
+            if (json.has("action")) {
+                String action = json.optString("action", "").trim().toLowerCase(Locale.US);
+                if ("hd_spike".equals(action) || "spike".equals(action)) {
+                    appendMessage("📷 /camera hd_spike");
+                    if (switchRtmp != null && switchRtmp.isChecked()) {
+                        appendMessage("📷 hd_spike blocked while RTMP On");
+                        return;
+                    }
+                    if (hdCameraForeheadStreamer != null) {
+                        hdCameraForeheadStreamer.runSpikeAsync(true);
+                    }
+                    return;
+                }
+            }
             if (!touchedSource && !touchedRtmp) {
                 appendMessage("📷 /camera needs source and/or rtmp");
                 return;
             }
             if (touchedSource) {
                 String source = json.optString("source", cameraLivePath).trim().toLowerCase(Locale.US);
-                if (!"face".equals(source) && !"body".equals(source) && !"stream".equals(source)) {
-                    appendMessage("📷 Unknown camera source: " + source);
-                    return;
-                }
                 if ("stream".equals(source)) {
                     source = "face";
+                }
+                if (!isKnownCameraSource(source)) {
+                    appendMessage("📷 Unknown camera source: " + source);
+                    return;
                 }
                 cameraLivePath = source;
                 getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
                         .edit()
                         .putString(KEY_CAMERA_PATH, cameraLivePath)
                         .apply();
-                // Head always → live/face; Orbbec → live/body. source only selects My Sanbot HLS path.
-                if ("body".equals(cameraLivePath)) {
-                    boolean bodyOk = orbbecBodyStreamer != null && orbbecBodyStreamer.isHealthy();
-                    appendMessage(bodyOk
-                            ? "📷 Preferred preview → live/body (Orbbec Astra)"
-                            : "📷 Preferred preview → live/body (Orbbec not ready yet)");
-                } else {
-                    appendMessage("📷 Preferred preview → live/face (head camera)");
-                }
+                appendMessage("📷 Preferred preview → live/" + cameraLivePath
+                        + " (" + cameraSourceNote(cameraLivePath) + ")");
+                maybeStartAuxCameraPublisher(source);
             }
             if (touchedRtmp) {
                 boolean on = json.has("rtmp")
@@ -750,6 +806,77 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
         } catch (Exception e) {
             e.printStackTrace();
         }
+    }
+
+    private static boolean isKnownCameraSource(String source) {
+        return "face".equals(source) || "body".equals(source) || "forehead".equals(source)
+                || "usb".equals(source) || "depth".equals(source);
+    }
+
+    private String cameraSourceNote(String source) {
+        switch (source) {
+            case "body":
+                return "Orbbec color";
+            case "forehead":
+                return "HDCamera / forehead";
+            case "usb":
+                return "external UVC";
+            case "depth":
+                return "Orbbec depth-gray";
+            default:
+                return "head HAL";
+        }
+    }
+
+    /** Start forehead/USB only when selected — concurrent HW encode with Face crashes Nano. */
+    private void maybeStartAuxCameraPublisher(String source) {
+        if (switchRtmp == null || !switchRtmp.isChecked()) {
+            return;
+        }
+        String ip = sanitizeBrokerIp(editTextIp != null ? editTextIp.getText().toString() : "");
+        if (ip.isEmpty()) {
+            return;
+        }
+        if ("forehead".equals(source) && hdCameraForeheadStreamer != null) {
+            hdCameraForeheadStreamer.setBrokerIp(ip);
+            appendMessage("📷 Starting HD forehead → live/forehead…");
+            hdCameraForeheadStreamer.start();
+        } else if ("usb".equals(source) && uvcUsbStreamer != null) {
+            uvcUsbStreamer.setBrokerIp(ip);
+            uvcUsbStreamer.refreshAvailability();
+            if (uvcUsbStreamer.findSecondaryCameraId() >= 0) {
+                appendMessage("📷 Starting USB UVC → live/usb…");
+                uvcUsbStreamer.start();
+            } else {
+                appendMessage("📷 USB UVC skipped (no secondary Camera HAL id)");
+            }
+        }
+    }
+
+    /**
+     * Prefer a single IPv4. Double-paste often becomes {@code 192.168.1.4192.168.1.4}
+     * (the two addresses share the digit {@code 4}). Find the first valid 0–255 octet IPv4
+     * as a prefix match (no trailing {@code \\b}, which would reject that case).
+     */
+    private static String sanitizeBrokerIp(String raw) {
+        if (raw == null) {
+            return "";
+        }
+        String s = raw.trim();
+        if (s.isEmpty() || s.contains("x") || s.contains("X")) {
+            // Placeholder like 192.168.x.x
+            return "";
+        }
+        // (?!\\d) so "192.168.1.4192…" does not yield "192.168.1.41"; glued
+        // "192.168.1.4"+"192.168.1.4" still finds a real trailing/leading address.
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile(
+                "(?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)"
+                        + "(?:\\.(?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)){3}(?!\\d)")
+                .matcher(s);
+        if (m.find()) {
+            return m.group();
+        }
+        return "";
     }
 
     /** Toggle bridge RTMP switch from MQTT/WS (keeps UI + stream in sync). */
@@ -1079,6 +1206,9 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             needed.add(Manifest.permission.RECORD_AUDIO);
         }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+            needed.add(Manifest.permission.WRITE_EXTERNAL_STORAGE);
+        }
         if (!needed.isEmpty()) {
             ActivityCompat.requestPermissions(this, needed.toArray(new String[0]), CAMERA_PERMISSION_REQUEST_CODE);
         } else {
@@ -1146,14 +1276,19 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
     private final Runnable startBodyAfterHeadRunnable = this::startOrbbecBodyIfNeeded;
 
     private void startOrbbecBodyIfNeeded() {
-        if (orbbecBodyStreamer == null) return;
         if (switchRtmp == null || !switchRtmp.isChecked()) return;
         String ip = editTextIp != null ? editTextIp.getText().toString().trim() : "";
-        orbbecBodyStreamer.setBrokerIp(ip.isEmpty() ? "192.168.1.4" : ip);
-        if (!orbbecBodyStreamer.isStreaming()) {
-            appendMessage("📷 Starting Orbbec body → live/body…");
-            orbbecBodyStreamer.start();
+        String broker = ip.isEmpty() ? "192.168.1.4" : ip;
+        if (orbbecBodyStreamer != null) {
+            orbbecBodyStreamer.setBrokerIp(sanitizeBrokerIp(broker));
+            if (!orbbecBodyStreamer.isStreaming()) {
+                appendMessage("📷 Starting Orbbec body+depth → live/body + live/depth…");
+                orbbecBodyStreamer.start();
+            }
         }
+        // Forehead / USB are NOT auto-started here — Nano HW encoder + single-client
+        // camera stack SIGSEGVs when Face + HDCamera/UVC encode at once. Start those
+        // when My Sanbot selects source forehead/usb (handleCameraControl).
     }
 
     private void scheduleOrbbecBodyAfterHead() {
@@ -1166,16 +1301,36 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
         if (orbbecBodyStreamer != null) {
             orbbecBodyStreamer.stop();
         }
+        if (hdCameraForeheadStreamer != null) {
+            hdCameraForeheadStreamer.stop();
+        }
+        if (uvcUsbStreamer != null) {
+            uvcUsbStreamer.stop();
+        }
     }
 
     private void putCameraStatusFields(JSONObject payload) throws Exception {
         boolean bodyOk = orbbecBodyStreamer != null && orbbecBodyStreamer.isHealthy();
+        boolean depthOk = orbbecBodyStreamer != null && orbbecBodyStreamer.isDepthHealthy();
+        boolean foreheadOk = hdCameraForeheadStreamer != null && hdCameraForeheadStreamer.isHealthy();
+        boolean usbOk = uvcUsbStreamer != null && uvcUsbStreamer.isHealthy();
         payload.put("camera_source", cameraLivePath);
         payload.put("dual_camera", bodyOk);
         payload.put("body_camera_available", bodyOk);
-        payload.put("camera_note", bodyOk
-                ? "Face=head camera; Body=Orbbec Astra"
-                : "Head camera on live/face; Orbbec body unavailable (USB/session)");
+        payload.put("depth_camera_available", depthOk);
+        payload.put("forehead_camera_available", foreheadOk);
+        payload.put("usb_camera_available", usbOk);
+        if (hdCameraForeheadStreamer != null) {
+            payload.put("hd_spike_ok", hdCameraForeheadStreamer.isSpikeOk());
+            payload.put("hd_spike_distinct", hdCameraForeheadStreamer.isLikelyDistinct());
+            payload.put("hd_spike_summary", hdCameraForeheadStreamer.getSpikeSummary());
+        }
+        StringBuilder note = new StringBuilder("Face=head HAL");
+        if (foreheadOk) note.append("; Forehead=HDCamera");
+        if (bodyOk) note.append("; Body=Orbbec color");
+        if (depthOk) note.append("; Depth=Orbbec gray");
+        if (usbOk) note.append("; USB=UVC");
+        payload.put("camera_note", note.toString());
         payload.put("rtmp_on", switchRtmp != null && switchRtmp.isChecked());
     }
 
@@ -1190,6 +1345,46 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
             appendMessage(available
                     ? "✅ Orbbec body camera available (live/body)"
                     : "⚠️ Orbbec body camera unavailable");
+            publishInfoSnapshotSoon();
+        });
+    }
+
+    @Override
+    public void onDepthAvailabilityChanged(boolean available) {
+        runOnUiThread(() -> {
+            appendMessage(available
+                    ? "✅ Orbbec depth available (live/depth)"
+                    : "⚠️ Orbbec depth unavailable");
+            publishInfoSnapshotSoon();
+        });
+    }
+
+    @Override
+    public void onHdLog(String message) {
+        runOnUiThread(() -> appendMessage("📷 " + message));
+    }
+
+    @Override
+    public void onForeheadAvailabilityChanged(boolean available) {
+        runOnUiThread(() -> {
+            appendMessage(available
+                    ? "✅ Forehead/HDCamera available (live/forehead)"
+                    : "⚠️ Forehead/HDCamera unavailable");
+            publishInfoSnapshotSoon();
+        });
+    }
+
+    @Override
+    public void onUsbCamLog(String message) {
+        runOnUiThread(() -> appendMessage("📷 " + message));
+    }
+
+    @Override
+    public void onUsbCameraAvailabilityChanged(boolean available) {
+        runOnUiThread(() -> {
+            appendMessage(available
+                    ? "✅ USB UVC available (live/usb)"
+                    : "⚠️ USB UVC unavailable");
             publishInfoSnapshotSoon();
         });
     }
@@ -1764,6 +1959,7 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
             surfaceViewPreview.setVisibility(View.VISIBLE);
         }
         rtmpPublishAttempts = 0;
+        releaseFaceHalCamera();
         if (rtmpStream != null) {
             try {
                 if (rtmpStream.isStreaming()) {
@@ -1777,115 +1973,188 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
             }
             rtmpStream = null;
         }
-        rtmpStream = new GenericStream(this, this);
-        Log.d("RTMP", "Iniciando initRtmpStream: W=" + STREAM_WIDTH + " H=" + STREAM_HEIGHT + " bitrate=" + VIDEO_BITRATE + " rot=" + STREAM_ROTATION);
-        rtmpStream.changeAudioSource(new MicrophoneSource()); // ativa microfone
-        boolean prepared;
-        try {
-            // Prepare video before audio so MediaMTX is more likely to see H264 during track setup.
-            prepared = rtmpStream.prepareVideo(STREAM_WIDTH, STREAM_HEIGHT, VIDEO_BITRATE, 30)
-                    && rtmpStream.prepareAudio(SAMPLE_RATE, IS_STEREO, AUDIO_BITRATE);
-            Log.d("RTMP", "prepareVideo retornou: " + prepared);
-        } catch (IllegalArgumentException e) {
-            Log.e("RTMP", "IllegalArgumentException em prepareVideo: " + e.getMessage());
-            prepared = false;
-        }
-        if (prepared) {
-            tryStartRtmpPreview();
-            // Always schedule publish with retries — do not rely solely on surfaceCreated
-            // (SurfaceView GONE→VISIBLE often never re-fires the callback on Nano).
-            scheduleRtmpPublish();
-        } else {
-            appendMessage("❌ Failed to prepare RTMP streaming. Check logs for details.");
-        }
-    }
+        faceBufferSource = null;
 
-    private void tryStartRtmpPreview() {
-        if (rtmpStream == null || surfaceViewPreview == null || rtmpStream.isOnPreview()) {
-            return;
-        }
-        SurfaceHolder holder = surfaceViewPreview.getHolder();
-        if (holder != null && holder.getSurface() != null && holder.getSurface().isValid()) {
-            try {
-                rtmpStream.startPreview(surfaceViewPreview);
-            } catch (IllegalArgumentException e) {
-                Log.e("RTMP", "Erro ao iniciar preview: " + e.getMessage());
-            }
-        } else if (holder != null) {
-            holder.addCallback(new SurfaceHolder.Callback() {
-                @Override
-                public void surfaceCreated(SurfaceHolder surfaceHolder) {
-                    try {
-                        if (rtmpStream != null && !rtmpStream.isOnPreview()) {
-                            rtmpStream.startPreview(surfaceViewPreview);
-                        }
-                    } catch (IllegalArgumentException e) {
-                        Log.e("RTMP", "Erro ao iniciar preview: " + e.getMessage());
-                    }
-                    surfaceHolder.removeCallback(this);
-                    scheduleRtmpPublish();
-                }
-
-                @Override public void surfaceChanged(SurfaceHolder surfaceHolder, int format, int width, int height) {}
-                @Override public void surfaceDestroyed(SurfaceHolder surfaceHolder) {}
-            });
-        }
-    }
-
-    private final Runnable rtmpPublishRunnable = this::startRtmpPublishIfReady;
-
-    /** Publish after preview/encoder warm-up so MediaMTX sees H264, not audio-only. */
-    private void scheduleRtmpPublish() {
-        rtmpHandler.removeCallbacks(rtmpPublishRunnable);
-        rtmpHandler.postDelayed(rtmpPublishRunnable, 750);
-    }
-
-    private void startRtmpPublishIfReady() {
-        if (rtmpStream == null || switchRtmp == null || !switchRtmp.isChecked()) {
-            return;
-        }
-        if (rtmpStream.isStreaming()) {
-            rtmpPublishAttempts = 0;
-            return;
-        }
-        // Best-effort local preview. Nano SurfaceView often stays invalid after GONE→VISIBLE,
-        // but Pedro GenericStream can publish via startSources() without preview.
-        if (!rtmpStream.isOnPreview()) {
-            tryStartRtmpPreview();
-            if (!rtmpStream.isOnPreview() && rtmpPublishAttempts < 2) {
-                rtmpPublishAttempts++;
-                Log.d("RTMP", "preview not ready yet; retry before headless publish " + rtmpPublishAttempts);
-                rtmpHandler.postDelayed(rtmpPublishRunnable, 400);
-                return;
-            }
-            if (!rtmpStream.isOnPreview()) {
-                Log.w("RTMP", "publishing without local SurfaceView preview");
-                appendMessage("📡 RTMP: publishing without local preview (SurfaceView not ready)");
-            }
-        }
-        String ip = editTextIp.getText().toString().trim();
+        // Nano V4L2 HAL is single-client: Pedro Camera1/Camera2 constructors probe camera 1
+        // and throw "Too many users" / CameraAccessException. Feed Camera 0 via BufferVideoSource.
+        String ip = sanitizeBrokerIp(editTextIp != null ? editTextIp.getText().toString() : "");
         if (ip.isEmpty()) {
-            appendMessage("❌ RTMP: Server IP is empty");
-            return;
+            // Last known good / LAN MediaMTX default — don't flip RTMP Off for a blank field.
+            String saved = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getString(KEY_LAST_IP, "");
+            ip = sanitizeBrokerIp(saved);
+            if (ip.isEmpty()) {
+                ip = "192.168.1.4";
+            }
+            appendMessage("📡 Server IP empty/corrupt — using " + ip);
+            if (editTextIp != null) {
+                editTextIp.setText(ip);
+            }
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().putString(KEY_LAST_IP, ip).apply();
+        } else if (editTextIp != null && !ip.equals(editTextIp.getText().toString().trim())) {
+            appendMessage("📡 Server IP cleaned → " + ip);
+            editTextIp.setText(ip);
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().putString(KEY_LAST_IP, ip).apply();
         }
+        Log.i("RTMP", "init with broker IP " + ip);
         if (orbbecBodyStreamer != null) {
             orbbecBodyStreamer.setBrokerIp(ip);
         }
-        // Head camera always publishes live/face (Orbbec owns live/body).
-        String rtmpUrl = "rtmp://" + ip + ":1935/live/face";
+        if (hdCameraForeheadStreamer != null) {
+            hdCameraForeheadStreamer.setBrokerIp(ip);
+        }
+        if (uvcUsbStreamer != null) {
+            uvcUsbStreamer.setBrokerIp(ip);
+        }
+
         try {
+            int[] wh = openFaceHalCameraOnly();
+            if (wh == null) {
+                appendMessage("❌ RTMP: Camera.open(0) failed — turn HD spike Off / close other camera apps");
+                failRtmpInit();
+                return;
+            }
+            final int camW = wh[0];
+            final int camH = wh[1];
+            faceBufferSource = new BufferVideoSource(BufferVideoSource.Format.NV21, VIDEO_BITRATE);
+            rtmpStream = new GenericStream(this, this, faceBufferSource, new MicrophoneSource());
+            boolean prepared = rtmpStream.prepareVideo(camW, camH, VIDEO_BITRATE, 15)
+                    && rtmpStream.prepareAudio(SAMPLE_RATE, IS_STEREO, AUDIO_BITRATE);
+            Log.d("RTMP", "prepareVideo(NV21 " + camW + "x" + camH + ")=" + prepared);
+            if (!prepared) {
+                appendMessage("❌ Failed to prepare RTMP streaming.");
+                failRtmpInit();
+                return;
+            }
+            String rtmpUrl = "rtmp://" + ip + ":1935/live/face";
             rtmpStream.startStream(rtmpUrl);
-            rtmpPublishAttempts = 0;
-            appendMessage("📡 Head RTMP streaming started: " + rtmpUrl);
+            attachFaceHalPreviewCallback(camW, camH);
+            appendMessage("📡 Head RTMP " + camW + "x" + camH + " → " + rtmpUrl);
             Log.d("RTMP", "startStream " + rtmpUrl);
-            // Body starts from onConnectionSuccess after a short delay.
         } catch (Exception e) {
-            Log.e("RTMP", "startStream failed: " + e.getMessage());
-            appendMessage("❌ RTMP startStream failed: " + e.getMessage());
-            if (rtmpPublishAttempts++ < 5) {
-                rtmpHandler.postDelayed(rtmpPublishRunnable, 1000);
+            Log.e("RTMP", "initRtmpStream failed", e);
+            appendMessage("❌ RTMP init failed: " + e.getMessage());
+            failRtmpInit();
+        }
+    }
+
+    private void failRtmpInit() {
+        releaseFaceHalCamera();
+        if (rtmpStream != null) {
+            try {
+                if (rtmpStream.isStreaming()) {
+                    rtmpStream.stopStream();
+                }
+                rtmpStream.release();
+            } catch (Exception ignored) {
+            }
+            rtmpStream = null;
+        }
+        faceBufferSource = null;
+        if (switchRtmp != null && switchRtmp.isChecked()) {
+            switchRtmp.setChecked(false);
+        }
+    }
+
+    /** Open only HAL camera 0 — never probe camera 1 (Nano rejects second client). */
+    private int[] openFaceHalCameraOnly() {
+        synchronized (faceCameraLock) {
+            releaseFaceHalCameraLocked();
+            try {
+                faceHalCamera = Camera.open(0);
+                if (faceHalCamera == null) {
+                    return null;
+                }
+                Camera.Parameters params = faceHalCamera.getParameters();
+                Camera.Size best = null;
+                for (Camera.Size s : params.getSupportedPreviewSizes()) {
+                    if (s.width == STREAM_WIDTH && s.height == STREAM_HEIGHT) {
+                        best = s;
+                        break;
+                    }
+                    if (best == null
+                            || Math.abs(s.width - STREAM_WIDTH) + Math.abs(s.height - STREAM_HEIGHT)
+                            < Math.abs(best.width - STREAM_WIDTH) + Math.abs(best.height - STREAM_HEIGHT)) {
+                        best = s;
+                    }
+                }
+                if (best != null) {
+                    params.setPreviewSize(best.width, best.height);
+                    try {
+                        params.setPreviewFormat(ImageFormat.NV21);
+                    } catch (Exception ignored) {
+                    }
+                    faceHalCamera.setParameters(params);
+                }
+                faceHalCamera.setPreviewTexture(new SurfaceTexture(10));
+                int w = best != null ? best.width : STREAM_WIDTH;
+                int h = best != null ? best.height : STREAM_HEIGHT;
+                return new int[]{w, h};
+            } catch (Exception e) {
+                Log.e("RTMP", "Face HAL open failed", e);
+                releaseFaceHalCameraLocked();
+                return null;
             }
         }
+    }
+
+    private void attachFaceHalPreviewCallback(int previewW, int previewH) {
+        synchronized (faceCameraLock) {
+            if (faceHalCamera == null) {
+                return;
+            }
+            // Prefer non-buffer callback on Nano — WithBuffer SIGSEGVs in JNICameraContext::copyAndPost.
+            faceHalCamera.setPreviewCallback((data, camera) -> {
+                BufferVideoSource src = faceBufferSource;
+                GenericStream stream = rtmpStream;
+                if (data == null || src == null || stream == null || !stream.isStreaming()) {
+                    return;
+                }
+                try {
+                    // Copy — HAL may reuse the array before Pedro finishes reading.
+                    src.setBuffer(java.util.Arrays.copyOf(data, data.length));
+                } catch (Exception e) {
+                    Log.w("RTMP", "face buffer push: " + e.getMessage());
+                }
+            });
+            faceHalCamera.startPreview();
+            Log.d("RTMP", "Face HAL preview callback " + previewW + "x" + previewH);
+        }
+    }
+
+    private void releaseFaceHalCamera() {
+        synchronized (faceCameraLock) {
+            releaseFaceHalCameraLocked();
+        }
+    }
+
+    private void releaseFaceHalCameraLocked() {
+        if (faceHalCamera != null) {
+            try {
+                faceHalCamera.setPreviewCallback(null);
+            } catch (Exception ignored) {
+            }
+            try {
+                faceHalCamera.stopPreview();
+            } catch (Exception ignored) {
+            }
+            try {
+                faceHalCamera.release();
+            } catch (Exception ignored) {
+            }
+            faceHalCamera = null;
+        }
+    }
+
+    private final Runnable rtmpPublishRunnable = () -> {
+        // Retries after connection failure: re-init whole face path.
+        if (switchRtmp != null && switchRtmp.isChecked()) {
+            initRtmpStream();
+        }
+    };
+
+    private void scheduleRtmpPublish() {
+        rtmpHandler.removeCallbacks(rtmpPublishRunnable);
+        rtmpHandler.postDelayed(rtmpPublishRunnable, 1500);
     }
 
     @Override
@@ -1934,18 +2203,26 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
     private void stopRtmpStream() {
         rtmpHandler.removeCallbacks(rtmpPublishRunnable);
         rtmpPublishAttempts = 0;
+        releaseFaceHalCamera();
         if (rtmpStream != null) {
-            if (rtmpStream.isStreaming()) {
-                rtmpStream.stopStream();
+            try {
+                if (rtmpStream.isStreaming()) {
+                    rtmpStream.stopStream();
+                }
+            } catch (Exception ignored) {
             }
-            if (rtmpStream.isOnPreview()) {
-                rtmpStream.stopPreview();
+            try {
+                if (rtmpStream.isOnPreview()) {
+                    rtmpStream.stopPreview();
+                }
+            } catch (Exception ignored) {
             }
             try {
                 rtmpStream.release();
             } catch (Exception ignored) {
             }
             rtmpStream = null;
+            faceBufferSource = null;
             appendMessage("🛑 RTMP streaming stopped by user.");
         }
     }

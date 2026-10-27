@@ -36,6 +36,9 @@ final class OrbbecBodyStreamer implements ConnectChecker {
         void onBodyLog(String message);
 
         void onBodyAvailabilityChanged(boolean available);
+
+        /** Depth RTMP availability ({@code live/depth}). Default no-op via MainActivity. */
+        default void onDepthAvailabilityChanged(boolean available) {}
     }
 
     private static final String TAG = "OrbbecBody";
@@ -60,12 +63,16 @@ final class OrbbecBodyStreamer implements ConnectChecker {
     private final AtomicBoolean publishing = new AtomicBoolean(false);
     private final AtomicBoolean sessionOpen = new AtomicBoolean(false);
     private final AtomicBoolean healthy = new AtomicBoolean(false);
+    private final AtomicBoolean depthHealthy = new AtomicBoolean(false);
     private final AtomicBoolean startRequested = new AtomicBoolean(false);
+    private final AtomicBoolean depthRequested = new AtomicBoolean(true);
     private final AtomicBoolean opening = new AtomicBoolean(false);
 
     private UsbDeviceConnection usbConn;
     private GenericStream rtmpStream;
+    private GenericStream depthRtmpStream;
     private BufferVideoSource bufferSource;
+    private BufferVideoSource depthBufferSource;
     private Thread streamThread;
     private String brokerIp = "192.168.1.4";
     private boolean receiverRegistered = false;
@@ -99,8 +106,25 @@ final class OrbbecBodyStreamer implements ConnectChecker {
         return healthy.get();
     }
 
+    boolean isDepthHealthy() {
+        return depthHealthy.get();
+    }
+
     boolean isStreaming() {
         return publishing.get();
+    }
+
+    boolean hasSession() {
+        return sessionOpen.get();
+    }
+
+    /** When true (default), color loop also publishes grayscale depth → live/depth. */
+    void setDepthPublishEnabled(boolean enabled) {
+        depthRequested.set(enabled);
+        if (!enabled) {
+            releaseDepthPublishResources();
+            setDepthHealthy(false);
+        }
     }
 
     void setBrokerIp(String ip) {
@@ -236,8 +260,33 @@ final class OrbbecBodyStreamer implements ConnectChecker {
             setHealthy(true);
             log("Body RTMP → " + url);
 
+            if (depthRequested.get()) {
+                try {
+                    depthBufferSource = new BufferVideoSource(BufferVideoSource.Format.ARGB, STREAM_BITRATE);
+                    depthRtmpStream = new GenericStream(appContext, this, depthBufferSource, new NoAudioSource());
+                    if (depthRtmpStream.prepareVideo(STREAM_W, STREAM_H, STREAM_BITRATE, 10)) {
+                        try {
+                            depthRtmpStream.prepareAudio(44100, false, 64 * 1024);
+                        } catch (Exception ignored) {
+                        }
+                        String depthUrl = "rtmp://" + brokerIp + ":1935/live/depth";
+                        depthRtmpStream.startStream(depthUrl);
+                        setDepthHealthy(true);
+                        log("Depth RTMP → " + depthUrl);
+                    } else {
+                        log("FAIL: depth prepareVideo");
+                        setDepthHealthy(false);
+                    }
+                } catch (Exception e) {
+                    log("Depth RTMP setup note: " + e.getMessage());
+                    setDepthHealthy(false);
+                }
+            }
+
             final int[] argb = new int[srcW * srcH];
+            final int[] depthArgb = new int[srcW * srcH];
             final int[] scaled = new int[STREAM_W * STREAM_H];
+            final int[] depthScaled = new int[STREAM_W * STREAM_H];
             while (publishing.get() && startRequested.get()) {
                 int rc = OrbbecNative.nativeGrabArgb(argb);
                 if (rc != 1) {
@@ -246,6 +295,15 @@ final class OrbbecBodyStreamer implements ConnectChecker {
                 }
                 scaleNearest(argb, srcW, srcH, scaled, STREAM_W, STREAM_H);
                 bufferSource.setBuffer(scaled);
+
+                if (depthRequested.get() && depthBufferSource != null) {
+                    // Same WaitAndUpdate already done in nativeGrabArgb; pull depth map only.
+                    int drc = OrbbecNative.nativeGrabDepthArgb(depthArgb);
+                    if (drc == 1) {
+                        scaleNearest(depthArgb, srcW, srcH, depthScaled, STREAM_W, STREAM_H);
+                        depthBufferSource.setBuffer(depthScaled);
+                    }
+                }
             }
         } catch (UnsatisfiedLinkError e) {
             log("FAIL native load: " + e.getMessage());
@@ -288,6 +346,7 @@ final class OrbbecBodyStreamer implements ConnectChecker {
     }
 
     private synchronized void releasePublishResources() {
+        releaseDepthPublishResources();
         GenericStream stream = rtmpStream;
         rtmpStream = null;
         bufferSource = null;
@@ -299,6 +358,29 @@ final class OrbbecBodyStreamer implements ConnectChecker {
             stream.release();
         } catch (Exception e) {
             Log.w(TAG, "rtmp stop", e);
+        }
+    }
+
+    private synchronized void releaseDepthPublishResources() {
+        GenericStream stream = depthRtmpStream;
+        depthRtmpStream = null;
+        depthBufferSource = null;
+        setDepthHealthy(false);
+        if (stream == null) return;
+        try {
+            if (stream.isStreaming()) {
+                stream.stopStream();
+            }
+            stream.release();
+        } catch (Exception e) {
+            Log.w(TAG, "depth rtmp stop", e);
+        }
+    }
+
+    private void setDepthHealthy(boolean ok) {
+        boolean prev = depthHealthy.getAndSet(ok);
+        if (prev != ok && listener != null) {
+            listener.onDepthAvailabilityChanged(ok);
         }
     }
 

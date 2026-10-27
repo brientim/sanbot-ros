@@ -232,6 +232,39 @@ Java_com_grin_sanbotrosbridge_OrbbecNative_nativeGrabArgb(
     return 1;
 }
 
+/**
+ * Depth-gray ARGB from gDepth using the last WaitAndUpdate (call after nativeGrabArgb
+ * in the same loop — does not wait again).
+ */
+extern "C" JNIEXPORT jint JNICALL
+Java_com_grin_sanbotrosbridge_OrbbecNative_nativeGrabDepthArgb(
+        JNIEnv *env, jclass /*clazz*/, jintArray jArgb) {
+    std::lock_guard<std::mutex> lock(gMu);
+    if (!gRunning || !gCtx || !gDepth || jArgb == nullptr) return -1;
+
+    jsize len = env->GetArrayLength(jArgb);
+    if (len < (jsize) (gW * gH)) return -3;
+    jint *out = env->GetIntArrayElements(jArgb, nullptr);
+    if (!out) return -4;
+
+    const XnDepthPixel *map = xnGetDepthMap(gDepth);
+    if (!map) {
+        env->ReleaseIntArrayElements(jArgb, out, JNI_ABORT);
+        return -5;
+    }
+    uint16_t maxNz = 1;
+    for (XnUInt32 i = 0; i < gW * gH; i++) {
+        if (map[i] > maxNz) maxNz = map[i];
+    }
+    for (XnUInt32 i = 0; i < gW * gH; i++) {
+        uint8_t g = (uint8_t) ((map[i] * 255u) / maxNz);
+        out[i] = (jint) (0xFF000000u | (g << 16) | (g << 8) | g);
+    }
+
+    env->ReleaseIntArrayElements(jArgb, out, 0);
+    return 1;
+}
+
 /** One-shot probe still used by Probe button — writes PGM. */
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_grin_sanbotrosbridge_OrbbecNative_nativeProbe(
