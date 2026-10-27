@@ -58,7 +58,7 @@ import android.view.SurfaceHolder;
 import android.text.Editable;
 import android.text.TextWatcher;
 
-public class MainActivity extends TopBaseActivity implements MqttHandler.MqttStatusListener, TextToSpeech.OnInitListener, ConnectChecker {
+public class MainActivity extends TopBaseActivity implements MqttHandler.MqttStatusListener, TextToSpeech.OnInitListener, ConnectChecker, ControlWebSocketServer.Listener, OrbbecBodyStreamer.Listener {
 
     private EditText editTextName;
     private EditText editTextIp;
@@ -72,6 +72,7 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
     private TextView textViewMessages;
     private ScrollView scrollView;
     private Switch switchRtmp;
+    private Switch switchWsControl;
     private SurfaceView surfaceViewPreview;
     private Spinner spinnerLanguage;
     private CheckBox checkBoxShowLogs;
@@ -85,6 +86,10 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
     private boolean connected = false;
     private String selectedTopic = "All";
     private String robotName = "";
+    /** Preferred HLS path for My Sanbot (face|body). Head always publishes live/face; Orbbec → live/body. */
+    private String cameraLivePath = "face";
+    private ControlWebSocketServer controlWsServer;
+    private OrbbecBodyStreamer orbbecBodyStreamer;
 
     private static final String PREFS_NAME = "mqtt_prefs";
     private static final String KEY_LAST_IP = "last_broker_ip";
@@ -92,7 +97,10 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
     private static final String KEY_LAST_PORT = "last_broker_port";
     private static final String KEY_AUTO_CONNECT = "auto_connect";
     private static final String KEY_AUTO_LAUNCH = "auto_launch";
+    private static final String KEY_WS_CONTROL = "ws_control";
+    private static final String KEY_CAMERA_PATH = "camera_live_path";
     private static final int CAMERA_PERMISSION_REQUEST_CODE = 200;
+    private static final int WS_CONTROL_PORT = 8080;
 
     private SystemManager systemManager;
     private HardWareManager hardWareManager;
@@ -104,6 +112,10 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
     private Handler publishHandler = new Handler();
 
     private final Handler motionHandler = new Handler(Looper.getMainLooper());
+    /** Dedicated to RTMP publish warm-up — must not share motionHandler (drive used to clear it). */
+    private final Handler rtmpHandler = new Handler(Looper.getMainLooper());
+    private Runnable motionStopRunnable;
+    private int rtmpPublishAttempts = 0;
 
     private final Map<Integer, Long> lastIRUpdate = new HashMap<>();
     private static final long IR_UPDATE_INTERVAL_MS = 1000;  // 1 segundo por sensor
@@ -155,6 +167,7 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
         surfaceViewPreview = findViewById(R.id.surfaceViewPreview);
         surfaceViewPreview.setVisibility(View.GONE);
         switchRtmp = findViewById(R.id.switchRtmp);
+        switchWsControl = findViewById(R.id.switchWsControl);
         spinnerLanguage = findViewById(R.id.spinnerLanguage);
         checkBoxShowLogs = findViewById(R.id.checkBoxShowLogs);
         checkBoxAutoConnect = findViewById(R.id.checkBoxAutoConnect);
@@ -177,6 +190,29 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
             editTextIp.setText(lastIp);
         }
         String lastPort = prefs.getString(KEY_LAST_PORT, "1883");
+        cameraLivePath = prefs.getString(KEY_CAMERA_PATH, "face");
+        orbbecBodyStreamer = new OrbbecBodyStreamer(this, this);
+        orbbecBodyStreamer.register();
+        String brokerForBody = editTextIp != null ? editTextIp.getText().toString().trim() : "";
+        orbbecBodyStreamer.setBrokerIp(brokerForBody.isEmpty() ? "192.168.1.4" : brokerForBody);
+        boolean wsControlOn = prefs.getBoolean(KEY_WS_CONTROL, true);
+        if (switchWsControl != null) {
+            switchWsControl.setChecked(wsControlOn);
+            switchWsControl.setOnCheckedChangeListener((buttonView, isChecked) -> {
+                getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                        .edit()
+                        .putBoolean(KEY_WS_CONTROL, isChecked)
+                        .apply();
+                if (isChecked) {
+                    startControlWebSocket();
+                } else {
+                    stopControlWebSocket();
+                }
+            });
+            if (wsControlOn) {
+                startControlWebSocket();
+            }
+        }
         if (editTextPort != null && lastPort != null) {
             editTextPort.setText(lastPort);
         }
@@ -345,12 +381,16 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
                     checkCameraPermissions();
                 } else {
                     if (rtmpStream == null || !rtmpStream.isStreaming()) {
-                        initRtmpStream();
+                        // Show SurfaceView first, then init on next layout pass so the holder is valid.
                         surfaceViewPreview.setVisibility(View.VISIBLE);
+                        surfaceViewPreview.post(this::initRtmpStream);
                     }
+                    // Orbbec body starts after head RTMP connects (see onConnectionSuccess).
                 }
             } else {
+                rtmpHandler.removeCallbacks(startBodyAfterHeadRunnable);
                 stopRtmpStream();
+                stopOrbbecBody();
                 surfaceViewPreview.setVisibility(View.GONE);
             }
         });
@@ -447,7 +487,7 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
                             JSONObject touchJson = new JSONObject();
                             touchJson.put("part", part);
                             touchJson.put("description", getTouchPartName(part));
-                            mqttHandler.publishMessage(getPrefixedTopic("touch"), touchJson.toString());
+                            publishTelemetry("touch", touchJson);
                         } catch (Exception e) {
                             e.printStackTrace();
                         }
@@ -463,7 +503,7 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
                             JSONObject pirJson = new JSONObject();
                             pirJson.put("part", part == 1 ? "front" : "back");
                             pirJson.put("status", isChecked ? 1 : 0);
-                            mqttHandler.publishMessage(getPrefixedTopic("pir"), pirJson.toString());
+                            publishTelemetry("pir", pirJson);
                         } catch (Exception e) {
                             e.printStackTrace();
                         }
@@ -484,7 +524,7 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
                                 JSONObject irJson = new JSONObject();
                                 irJson.put("sensor", part);
                                 irJson.put("distance_cm", distance);
-                                mqttHandler.publishMessage(getPrefixedTopic("ir"), irJson.toString());
+                                publishTelemetry("ir", irJson);
                             } catch (Exception e) {
                                 e.printStackTrace();
                             }
@@ -499,7 +539,7 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
                 try {
                     JSONObject voiceJson = new JSONObject();
                     voiceJson.put("angle", angle);
-                    mqttHandler.publishMessage(getPrefixedTopic("voice_angle"), voiceJson.toString());
+                    publishTelemetry("voice_angle", voiceJson);
                 } catch (Exception e) {
                     e.printStackTrace();
                 }
@@ -511,8 +551,8 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
             public void onObstacleStatus(boolean status) {
                 try{
                     JSONObject json = new JSONObject();
-                    json.put("status", 1);
-                    mqttHandler.publishMessage(getPrefixedTopic("obstacle"), json.toString());
+                    json.put("status", status ? 1 : 0);
+                    publishTelemetry("obstacle", json);
                 } catch (Exception e) {
                     e.printStackTrace();
                 }
@@ -532,7 +572,7 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
                     gyroJson.put("x", x);
                     gyroJson.put("y", y);
                     gyroJson.put("z", z);
-                    mqttHandler.publishMessage(getPrefixedTopic("imu"), gyroJson.toString());
+                    publishTelemetry("imu", gyroJson);
                 } catch (Exception e) {
                     e.printStackTrace();
                 }
@@ -643,6 +683,8 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
             handleJointMotion(message);
         } else if (getPrefixedTopic("led").equals(topic)) {
             handleLedControl(message);
+        } else if (getPrefixedTopic("camera").equals(topic)) {
+            handleCameraControl(message);
         } else if (getPrefixedTopic("speak").equals(topic)) {
             try {
                 JSONObject json = new JSONObject(message);
@@ -659,7 +701,68 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
             } catch (Exception e) {
                 e.printStackTrace();
             }
+        } else if (getPrefixedTopic("system").equals(topic)) {
+            handleSystemControl(message);
         }
+    }
+
+    private void handleCameraControl(String message) {
+        try {
+            JSONObject json = new JSONObject(message);
+            boolean touchedSource = json.has("source");
+            boolean touchedRtmp = json.has("rtmp") || json.has("enabled") || json.has("streaming");
+            if (!touchedSource && !touchedRtmp) {
+                appendMessage("📷 /camera needs source and/or rtmp");
+                return;
+            }
+            if (touchedSource) {
+                String source = json.optString("source", cameraLivePath).trim().toLowerCase(Locale.US);
+                if (!"face".equals(source) && !"body".equals(source) && !"stream".equals(source)) {
+                    appendMessage("📷 Unknown camera source: " + source);
+                    return;
+                }
+                if ("stream".equals(source)) {
+                    source = "face";
+                }
+                cameraLivePath = source;
+                getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                        .edit()
+                        .putString(KEY_CAMERA_PATH, cameraLivePath)
+                        .apply();
+                // Head always → live/face; Orbbec → live/body. source only selects My Sanbot HLS path.
+                if ("body".equals(cameraLivePath)) {
+                    boolean bodyOk = orbbecBodyStreamer != null && orbbecBodyStreamer.isHealthy();
+                    appendMessage(bodyOk
+                            ? "📷 Preferred preview → live/body (Orbbec Astra)"
+                            : "📷 Preferred preview → live/body (Orbbec not ready yet)");
+                } else {
+                    appendMessage("📷 Preferred preview → live/face (head camera)");
+                }
+            }
+            if (touchedRtmp) {
+                boolean on = json.has("rtmp")
+                        ? json.optBoolean("rtmp", false)
+                        : json.has("enabled")
+                        ? json.optBoolean("enabled", false)
+                        : json.optBoolean("streaming", false);
+                setRtmpEnabledFromRemote(on);
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    /** Toggle bridge RTMP switch from MQTT/WS (keeps UI + stream in sync). */
+    private void setRtmpEnabledFromRemote(boolean on) {
+        runOnUiThread(() -> {
+            if (switchRtmp == null) return;
+            if (switchRtmp.isChecked() == on) {
+                appendMessage("📡 RTMP already " + (on ? "On" : "Off"));
+                return;
+            }
+            appendMessage("📡 RTMP → " + (on ? "On" : "Off") + " (remote)");
+            switchRtmp.setChecked(on);
+        });
     }
 
     private void handleLightControl(String message) {
@@ -694,15 +797,20 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
             int distance = json.optInt("distance", 0);
             int duration = json.optInt("duration", 0);
 
-            motionHandler.removeCallbacksAndMessages(null);
+            if (motionStopRunnable != null) {
+                motionHandler.removeCallbacks(motionStopRunnable);
+                motionStopRunnable = null;
+            }
             if (duration > 0) {
                 byte action = getActionFromDirection(direction);
                 NoAngleWheelMotion motion = new NoAngleWheelMotion(action, speed, 100, 0, NoAngleWheelMotion.STATUS_KEEP);
                 wheelMotionManager.doNoAngleMotion(motion);
-                motionHandler.postDelayed(() -> {
+                motionStopRunnable = () -> {
                     wheelMotionManager.doNoAngleMotion(new NoAngleWheelMotion(
                             NoAngleWheelMotion.ACTION_STOP, 0, 0, 0, NoAngleWheelMotion.STATUS_KEEP));
-                }, duration * 1000);
+                    motionStopRunnable = null;
+                };
+                motionHandler.postDelayed(motionStopRunnable, duration * 1000);
 
                 return;
             }
@@ -904,7 +1012,7 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
     private void subscribeToAllTopics() {
         // Commands only — do not subscribe to outbound telemetry (ir/imu/battery/…).
         // Subscribing + Show Logs caused unbounded TextView growth and ANRs.
-        String[] suffixes = new String[]{"light", "move", "joints", "led", "speak"};
+        String[] suffixes = new String[]{"light", "move", "joints", "led", "speak", "camera", "system"};
         java.util.List<String> spinnerItems = new java.util.ArrayList<>();
         spinnerItems.add("All");
 
@@ -1014,6 +1122,12 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
 
     @Override
     protected void onDestroy() {
+        stopControlWebSocket();
+        stopOrbbecBody();
+        if (orbbecBodyStreamer != null) {
+            orbbecBodyStreamer.unregister();
+            orbbecBodyStreamer = null;
+        }
         mqttHandler.disconnect();
         publishHandler.removeCallbacksAndMessages(null);
         if (rtmpStream != null) {
@@ -1025,6 +1139,268 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
         }
 
         super.onDestroy();
+    }
+
+    /** Delay so head live/face settles before second Pedro/RTMP publisher. */
+    private static final long BODY_AFTER_HEAD_MS = 2500L;
+    private final Runnable startBodyAfterHeadRunnable = this::startOrbbecBodyIfNeeded;
+
+    private void startOrbbecBodyIfNeeded() {
+        if (orbbecBodyStreamer == null) return;
+        if (switchRtmp == null || !switchRtmp.isChecked()) return;
+        String ip = editTextIp != null ? editTextIp.getText().toString().trim() : "";
+        orbbecBodyStreamer.setBrokerIp(ip.isEmpty() ? "192.168.1.4" : ip);
+        if (!orbbecBodyStreamer.isStreaming()) {
+            appendMessage("📷 Starting Orbbec body → live/body…");
+            orbbecBodyStreamer.start();
+        }
+    }
+
+    private void scheduleOrbbecBodyAfterHead() {
+        rtmpHandler.removeCallbacks(startBodyAfterHeadRunnable);
+        rtmpHandler.postDelayed(startBodyAfterHeadRunnable, BODY_AFTER_HEAD_MS);
+    }
+
+    private void stopOrbbecBody() {
+        rtmpHandler.removeCallbacks(startBodyAfterHeadRunnable);
+        if (orbbecBodyStreamer != null) {
+            orbbecBodyStreamer.stop();
+        }
+    }
+
+    private void putCameraStatusFields(JSONObject payload) throws Exception {
+        boolean bodyOk = orbbecBodyStreamer != null && orbbecBodyStreamer.isHealthy();
+        payload.put("camera_source", cameraLivePath);
+        payload.put("dual_camera", bodyOk);
+        payload.put("body_camera_available", bodyOk);
+        payload.put("camera_note", bodyOk
+                ? "Face=head camera; Body=Orbbec Astra"
+                : "Head camera on live/face; Orbbec body unavailable (USB/session)");
+        payload.put("rtmp_on", switchRtmp != null && switchRtmp.isChecked());
+    }
+
+    @Override
+    public void onBodyLog(String message) {
+        runOnUiThread(() -> appendMessage("📷 " + message));
+    }
+
+    @Override
+    public void onBodyAvailabilityChanged(boolean available) {
+        runOnUiThread(() -> {
+            appendMessage(available
+                    ? "✅ Orbbec body camera available (live/body)"
+                    : "⚠️ Orbbec body camera unavailable");
+            publishInfoSnapshotSoon();
+        });
+    }
+
+    private void startControlWebSocket() {
+        stopControlWebSocket();
+        try {
+            controlWsServer = new ControlWebSocketServer(WS_CONTROL_PORT, this);
+            controlWsServer.start();
+            appendMessage("🔌 WS control starting on :" + WS_CONTROL_PORT);
+        } catch (Exception e) {
+            appendMessage("❌ WS control failed: " + e.getMessage());
+            Log.e("SanbotRosBridge", "WS start failed", e);
+        }
+    }
+
+    private void stopControlWebSocket() {
+        if (controlWsServer != null) {
+            try {
+                controlWsServer.stop();
+            } catch (Exception e) {
+                Log.e("SanbotRosBridge", "WS stop failed", e);
+            }
+            controlWsServer = null;
+            appendMessage("🛑 WS control stopped");
+        }
+    }
+
+    @Override
+    public void onWsLog(String message) {
+        runOnUiThread(() -> appendMessage(message));
+    }
+
+    @Override
+    public String onControlMessage(String path, JSONObject body) {
+        final String p = path == null ? "" : path.trim();
+        final JSONObject b = body != null ? body : new JSONObject();
+        runOnUiThread(() -> {
+            try {
+                dispatchControlPath(p, b);
+            } catch (Exception e) {
+                appendMessage("WS dispatch error: " + e.getMessage());
+            }
+        });
+        // Synchronous status replies
+        if ("/status".equals(p) || "status".equals(p)) {
+            return buildStatusReply();
+        }
+        if ("/camera/mjpeg".equals(p)) {
+            return buildCameraHintReply();
+        }
+        try {
+            JSONObject ack = new JSONObject();
+            ack.put("path", p);
+            ack.put("ok", true);
+            return ack.toString();
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private void dispatchControlPath(String path, JSONObject body) throws Exception {
+        String normalized = path.startsWith("/") ? path : "/" + path;
+        appendMessage("WS " + normalized + " " + body.toString());
+        switch (normalized) {
+            case "/move":
+                handleMotionControl(body.toString());
+                break;
+            case "/stop":
+                handleMotionControl("{\"direction\":\"stop\"}");
+                break;
+            case "/led/white":
+            case "/light":
+                handleLightControl(body.toString());
+                break;
+            case "/led/color":
+            case "/led":
+                handleLedControl(body.toString());
+                break;
+            case "/tts":
+            case "/speak": {
+                String texto = body.optString("msg", body.optString("text", ""));
+                if (!texto.isEmpty()) {
+                    int speed = body.optInt("speed", 50);
+                    int volume = body.optInt("volume", 70);
+                    if (switchTtsType != null && switchTtsType.isChecked()) {
+                        handleSpeakSDK(texto, speed, volume);
+                    } else {
+                        handleSpeakAndroid(texto, speed, volume);
+                    }
+                }
+                break;
+            }
+            case "/head/absolute":
+            case "/head/move":
+            case "/joints":
+                if (!body.has("joint")) {
+                    // Controller-style absolute head may send pan/tilt fields
+                    if (body.has("pan") || body.has("yaw")) {
+                        JSONObject pan = new JSONObject();
+                        pan.put("joint", "head_pan");
+                        pan.put("angle", body.optInt("pan", body.optInt("yaw", 90)));
+                        pan.put("speed", body.optInt("speed", 50));
+                        handleJointMotion(pan.toString());
+                    }
+                    if (body.has("tilt")) {
+                        JSONObject tilt = new JSONObject();
+                        tilt.put("joint", "head_tilt");
+                        tilt.put("angle", body.optInt("tilt", 20));
+                        tilt.put("speed", body.optInt("speed", 50));
+                        handleJointMotion(tilt.toString());
+                    }
+                    if (!body.has("pan") && !body.has("yaw") && !body.has("tilt")) {
+                        handleJointMotion(body.toString());
+                    }
+                } else {
+                    handleJointMotion(body.toString());
+                }
+                break;
+            case "/head/center": {
+                JSONObject pan = new JSONObject();
+                pan.put("joint", "head_pan");
+                pan.put("angle", 90);
+                pan.put("speed", 50);
+                handleJointMotion(pan.toString());
+                JSONObject tilt = new JSONObject();
+                tilt.put("joint", "head_tilt");
+                tilt.put("angle", 20);
+                tilt.put("speed", 50);
+                handleJointMotion(tilt.toString());
+                break;
+            }
+            case "/head/relative":
+                // Map relative as absolute best-effort when joint provided
+                handleJointMotion(body.toString());
+                break;
+            case "/arm/move":
+                if (!body.has("joint")) {
+                    body.put("joint", body.optString("arm", "wing_both"));
+                }
+                handleJointMotion(body.toString());
+                break;
+            case "/camera":
+                handleCameraControl(body.toString());
+                break;
+            case "/camera/mjpeg":
+            case "/status":
+                // replied synchronously in onControlMessage
+                break;
+            case "/system":
+                handleSystemControl(body.toString());
+                break;
+            case "/emotion":
+            case "/autonomy":
+                appendMessage("WS " + normalized + " noted (bridge may need patched handlers)");
+                break;
+            default:
+                appendMessage("WS unknown path: " + normalized);
+                break;
+        }
+    }
+
+    private String buildStatusReply() {
+        try {
+            JSONObject payload = new JSONObject();
+            if (systemManager != null) {
+                int status = systemManager.getBatteryStatus();
+                String statusStr;
+                switch (status) {
+                    case 1:
+                        statusStr = "not_charging";
+                        break;
+                    case 2:
+                        statusStr = "charging_by_pile";
+                        break;
+                    default:
+                        statusStr = "charging_by_wire";
+                        break;
+                }
+                payload.put("battery_level", systemManager.getBatteryValue());
+                payload.put("battery_status", statusStr);
+                payload.put("device_id", systemManager.getDeviceId());
+            }
+            putCameraStatusFields(payload);
+            payload.put("mqtt_connected", connected);
+            putVolumeTelemetry(payload);
+            JSONObject wrap = new JSONObject();
+            wrap.put("path", "/status");
+            wrap.put("payload", payload);
+            // Also expose as /battery-like for My Sanbot telemetry handler
+            wrap.put("topic", "/battery");
+            return wrap.toString();
+        } catch (Exception e) {
+            return "{\"path\":\"/status\",\"error\":\"" + e.getMessage() + "\"}";
+        }
+    }
+
+    private String buildCameraHintReply() {
+        try {
+            String ip = editTextIp != null ? editTextIp.getText().toString().trim() : "";
+            JSONObject payload = new JSONObject();
+            payload.put("rtmp", "rtmp://" + ip + ":1935/live/" + cameraLivePath);
+            payload.put("hls", "http://" + ip + ":8888/live/" + cameraLivePath + "/index.m3u8");
+            payload.put("note", "MJPEG not streamed; use HLS/RTMP");
+            JSONObject wrap = new JSONObject();
+            wrap.put("path", "/camera/mjpeg");
+            wrap.put("payload", payload);
+            return wrap.toString();
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     private void startBatteryPublishingLoop() {
@@ -1050,8 +1426,9 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
                         JSONObject json = new JSONObject();
                         json.put("battery_level", batteryLevel);
                         json.put("battery_status", statusStr);
+                        putCameraStatusFields(json);
 
-                        mqttHandler.publishMessage(getPrefixedTopic("battery"), json.toString());
+                        publishTelemetry("battery", json);
                     } catch (Exception e) {
                         e.printStackTrace();
                     }
@@ -1074,8 +1451,9 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
                         json.put("android_version", android.os.Build.VERSION.RELEASE);
                         json.put("device_model", android.os.Build.MODEL);
                         putVolumeTelemetry(json);
+                        putCameraStatusFields(json);
 
-                        mqttHandler.publishMessage(getPrefixedTopic("info"), json.toString());
+                        publishTelemetry("info", json);
                     } catch (Exception e) {
                         e.printStackTrace();
                     }
@@ -1084,6 +1462,189 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
                 publishHandler.postDelayed(this, 5000); // repete a cada 5 segundos
             }
         }, 5000);
+    }
+
+    /**
+     * MQTT/WS /system:
+     * {"action":"reboot"}
+     * {"action":"mute"} / {"action":"unmute"}
+     * {"action":"volume","music_pct":80,"system_pct":50,"speak":70,"mute":false}
+     * Absolute stream steps: "music":0..max, "system":0..max (optional with pct).
+     */
+    private void handleSystemControl(String message) {
+        try {
+            JSONObject json = new JSONObject(message);
+            String action = json.optString("action", json.optString("cmd", "")).trim().toLowerCase(Locale.US);
+            if ("reboot".equals(action) || "restart".equals(action)) {
+                appendMessage("MQTT: rebooting robot…");
+                new Thread(() -> {
+                    try {
+                        Thread.sleep(800L);
+                    } catch (InterruptedException ignored) {
+                        Thread.currentThread().interrupt();
+                    }
+                    requestDeviceReboot();
+                }, "mqtt-reboot").start();
+                return;
+            }
+            if ("mute".equals(action)) {
+                applyMasterMute(true);
+                appendMessage("🔇 Master mute on");
+                publishInfoSnapshotSoon();
+                return;
+            }
+            if ("unmute".equals(action)) {
+                applyMasterMute(false);
+                appendMessage("🔊 Master mute off");
+                publishInfoSnapshotSoon();
+                return;
+            }
+            if ("volume".equals(action) || json.has("music") || json.has("system")
+                    || json.has("music_pct") || json.has("system_pct") || json.has("speak")
+                    || json.has("mute")) {
+                applyVolumeControl(json);
+                appendMessage("🔊 Volume updated");
+                publishInfoSnapshotSoon();
+                return;
+            }
+            appendMessage("Unknown /system action: " + action);
+        } catch (Exception e) {
+            e.printStackTrace();
+            appendMessage("/system error: " + e.getMessage());
+        }
+    }
+
+    private void applyVolumeControl(JSONObject json) {
+        android.media.AudioManager am =
+                (android.media.AudioManager) getSystemService(AUDIO_SERVICE);
+        if (am != null) {
+            if (json.has("music_pct")) {
+                setStreamPercent(am, android.media.AudioManager.STREAM_MUSIC, json.optInt("music_pct", -1));
+            } else if (json.has("music")) {
+                setStreamAbsolute(am, android.media.AudioManager.STREAM_MUSIC, json.optInt("music", -1));
+            }
+            if (json.has("system_pct")) {
+                setStreamPercent(am, android.media.AudioManager.STREAM_SYSTEM, json.optInt("system_pct", -1));
+            } else if (json.has("system")) {
+                setStreamAbsolute(am, android.media.AudioManager.STREAM_SYSTEM, json.optInt("system", -1));
+            }
+        }
+        if (json.has("speak")) {
+            int speak = Math.max(0, Math.min(100, json.optInt("speak", -1)));
+            if (speak >= 0) {
+                writeQihanSettingInt("robot_speak_volume", speak);
+            }
+        }
+        if (json.has("mute")) {
+            applyMasterMute(json.optBoolean("mute", false));
+        }
+    }
+
+    private void setStreamPercent(android.media.AudioManager am, int stream, int pct) {
+        if (pct < 0) return;
+        int max = Math.max(1, am.getStreamMaxVolume(stream));
+        int level = (Math.max(0, Math.min(100, pct)) * max) / 100;
+        am.setStreamVolume(stream, level, 0);
+    }
+
+    private void setStreamAbsolute(android.media.AudioManager am, int stream, int level) {
+        if (level < 0) return;
+        int max = Math.max(0, am.getStreamMaxVolume(stream));
+        am.setStreamVolume(stream, Math.max(0, Math.min(max, level)), 0);
+    }
+
+    private void applyMasterMute(boolean mute) {
+        android.media.AudioManager am =
+                (android.media.AudioManager) getSystemService(AUDIO_SERVICE);
+        if (am != null) {
+            // Hidden AudioManager.setMasterMute (works on Nano when Settings write is denied).
+            try {
+                java.lang.reflect.Method m = am.getClass()
+                        .getMethod("setMasterMute", boolean.class, int.class);
+                m.invoke(am, mute, 0);
+            } catch (Exception e) {
+                Log.w("SanbotRosBridge", "setMasterMute reflect failed", e);
+            }
+            try {
+                int dir = mute
+                        ? android.media.AudioManager.ADJUST_MUTE
+                        : android.media.AudioManager.ADJUST_UNMUTE;
+                am.adjustStreamVolume(android.media.AudioManager.STREAM_MUSIC, dir, 0);
+                am.adjustStreamVolume(android.media.AudioManager.STREAM_SYSTEM, dir, 0);
+                if (!mute) {
+                    if (am.getStreamVolume(android.media.AudioManager.STREAM_MUSIC) <= 0) {
+                        int max = Math.max(1, am.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC));
+                        am.setStreamVolume(android.media.AudioManager.STREAM_MUSIC, Math.max(1, max / 2), 0);
+                    }
+                    if (am.getStreamVolume(android.media.AudioManager.STREAM_SYSTEM) <= 0) {
+                        int max = Math.max(1, am.getStreamMaxVolume(android.media.AudioManager.STREAM_SYSTEM));
+                        am.setStreamVolume(android.media.AudioManager.STREAM_SYSTEM, Math.max(1, max / 2), 0);
+                    }
+                }
+            } catch (Exception e) {
+                Log.w("SanbotRosBridge", "adjustStreamVolume mute failed", e);
+            }
+        }
+        try {
+            if (android.provider.Settings.System.canWrite(this)) {
+                android.provider.Settings.System.putInt(
+                        getContentResolver(), "volume_master_mute", mute ? 1 : 0);
+            } else {
+                appendMessage("⚠ Enable Modify system settings for Sanbot-ros to clear MUTED flag");
+                try {
+                    android.content.Intent intent = new android.content.Intent(
+                            android.provider.Settings.ACTION_MANAGE_WRITE_SETTINGS);
+                    intent.setData(android.net.Uri.parse("package:" + getPackageName()));
+                    intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+                    startActivity(intent);
+                } catch (Exception ignored) {
+                }
+            }
+        } catch (Exception e) {
+            Log.w("SanbotRosBridge", "volume_master_mute write failed", e);
+        }
+    }
+
+    private void requestDeviceReboot() {
+        try {
+            android.os.PowerManager pm =
+                    (android.os.PowerManager) getSystemService(POWER_SERVICE);
+            if (pm != null) {
+                pm.reboot(null);
+                return;
+            }
+        } catch (Throwable t) {
+            Log.w("SanbotRosBridge", "PowerManager.reboot unavailable", t);
+        }
+        try {
+            Runtime.getRuntime().exec(new String[]{"/system/bin/reboot"});
+        } catch (Exception e) {
+            Log.e("SanbotRosBridge", "/system/bin/reboot failed", e);
+            try {
+                Runtime.getRuntime().exec(new String[]{"reboot"});
+            } catch (Exception e2) {
+                Log.e("SanbotRosBridge", "reboot failed", e2);
+            }
+        }
+    }
+
+    private void publishInfoSnapshotSoon() {
+        publishHandler.post(() -> {
+            if (systemManager == null) return;
+            try {
+                JSONObject json = new JSONObject();
+                json.put("robot_id", systemManager.getDeviceId());
+                json.put("ip", getLocalIpAddress());
+                json.put("main_service_version", systemManager.getMainServiceVersion());
+                json.put("android_version", android.os.Build.VERSION.RELEASE);
+                json.put("device_model", android.os.Build.MODEL);
+                putVolumeTelemetry(json);
+                putCameraStatusFields(json);
+                publishTelemetry("info", json);
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        });
     }
 
     /** Android media/system levels + Qihan speak volume for My Sanbot Robot Info. */
@@ -1140,24 +1701,88 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
         return null;
     }
 
+    private void writeQihanSettingInt(String key, int value) {
+        try {
+            android.net.Uri uri = android.net.Uri.parse(
+                    "content://com.qihancloud.setting.Provider/setting");
+            android.content.ContentValues values = new android.content.ContentValues();
+            values.put("key", key);
+            values.put("value", String.valueOf(value));
+            int updated = getContentResolver().update(uri, values, "key=?", new String[]{key});
+            if (updated <= 0) {
+                getContentResolver().insert(uri, values);
+            }
+        } catch (Exception e) {
+            Log.w("SanbotRosBridge", "writeQihanSettingInt " + key + " failed", e);
+        }
+    }
+
     private void publishSpeechToMqtt(String texto) {
-        if (mqttHandler != null && connected && texto != null && !texto.isEmpty()) {
+        if (texto != null && !texto.isEmpty()) {
             try {
                 JSONObject json = new JSONObject();
                 json.put("msg", texto);
-                mqttHandler.publishMessage(getPrefixedTopic("speech"), json.toString());
+                publishTelemetry("speech", json);
             } catch (Exception e) {
                 e.printStackTrace();
             }
         }
     }
 
+    /**
+     * Publish sensor / status telemetry to MQTT (when connected) and mirror to Direct WS clients.
+     * My Sanbot Radar uses /ir; Direct WS previously only saw /status → /battery.
+     */
+    private void publishTelemetry(String suffix, JSONObject payload) {
+        if (suffix == null || payload == null) {
+            return;
+        }
+        String topic = getPrefixedTopic(suffix);
+        String body = payload.toString();
+        if (mqttHandler != null) {
+            mqttHandler.publishMessage(topic, body);
+        }
+        ControlWebSocketServer ws = controlWsServer;
+        if (ws != null) {
+            try {
+                JSONObject wrap = new JSONObject();
+                wrap.put("path", "/" + suffix);
+                wrap.put("topic", topic);
+                wrap.put("payload", payload);
+                ws.broadcastJson(wrap.toString());
+            } catch (Exception e) {
+                Log.w("SanbotRosBridge", "WS telemetry broadcast failed: " + suffix, e);
+            }
+        }
+    }
+
     private void initRtmpStream() {
+        if (switchRtmp == null || !switchRtmp.isChecked()) {
+            return;
+        }
+        if (surfaceViewPreview != null && surfaceViewPreview.getVisibility() != View.VISIBLE) {
+            surfaceViewPreview.setVisibility(View.VISIBLE);
+        }
+        rtmpPublishAttempts = 0;
+        if (rtmpStream != null) {
+            try {
+                if (rtmpStream.isStreaming()) {
+                    rtmpStream.stopStream();
+                }
+                if (rtmpStream.isOnPreview()) {
+                    rtmpStream.stopPreview();
+                }
+                rtmpStream.release();
+            } catch (Exception ignored) {
+            }
+            rtmpStream = null;
+        }
         rtmpStream = new GenericStream(this, this);
         Log.d("RTMP", "Iniciando initRtmpStream: W=" + STREAM_WIDTH + " H=" + STREAM_HEIGHT + " bitrate=" + VIDEO_BITRATE + " rot=" + STREAM_ROTATION);
         rtmpStream.changeAudioSource(new MicrophoneSource()); // ativa microfone
         boolean prepared;
         try {
+            // Prepare video before audio so MediaMTX is more likely to see H264 during track setup.
             prepared = rtmpStream.prepareVideo(STREAM_WIDTH, STREAM_HEIGHT, VIDEO_BITRATE, 30)
                     && rtmpStream.prepareAudio(SAMPLE_RATE, IS_STEREO, AUDIO_BITRATE);
             Log.d("RTMP", "prepareVideo retornou: " + prepared);
@@ -1166,33 +1791,100 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
             prepared = false;
         }
         if (prepared) {
-            if (!rtmpStream.isOnPreview()) {
-                SurfaceHolder holder = surfaceViewPreview.getHolder();
-                if (holder != null && holder.getSurface() != null && holder.getSurface().isValid()) {
-                    rtmpStream.startPreview(surfaceViewPreview);
-                } else {
-                    holder.addCallback(new SurfaceHolder.Callback() {
-                        @Override
-                        public void surfaceCreated(SurfaceHolder surfaceHolder) {
-                            try {
-                                rtmpStream.startPreview(surfaceViewPreview);
-                            } catch (IllegalArgumentException e) {
-                                Log.e("RTMP", "Erro ao iniciar preview: " + e.getMessage());
-                            }
-                            surfaceHolder.removeCallback(this);
-                        }
-
-                        @Override public void surfaceChanged(SurfaceHolder surfaceHolder, int format, int width, int height) {}
-                        @Override public void surfaceDestroyed(SurfaceHolder surfaceHolder) {}
-                    });
-                }
-            }
-            String ip = editTextIp.getText().toString().trim();
-            String rtmpUrl = "rtmp://" + ip + ":1935/live/stream";
-            rtmpStream.startStream(rtmpUrl);
-            appendMessage("📡 RTMP streaming started: " + rtmpUrl);
+            tryStartRtmpPreview();
+            // Always schedule publish with retries — do not rely solely on surfaceCreated
+            // (SurfaceView GONE→VISIBLE often never re-fires the callback on Nano).
+            scheduleRtmpPublish();
         } else {
             appendMessage("❌ Failed to prepare RTMP streaming. Check logs for details.");
+        }
+    }
+
+    private void tryStartRtmpPreview() {
+        if (rtmpStream == null || surfaceViewPreview == null || rtmpStream.isOnPreview()) {
+            return;
+        }
+        SurfaceHolder holder = surfaceViewPreview.getHolder();
+        if (holder != null && holder.getSurface() != null && holder.getSurface().isValid()) {
+            try {
+                rtmpStream.startPreview(surfaceViewPreview);
+            } catch (IllegalArgumentException e) {
+                Log.e("RTMP", "Erro ao iniciar preview: " + e.getMessage());
+            }
+        } else if (holder != null) {
+            holder.addCallback(new SurfaceHolder.Callback() {
+                @Override
+                public void surfaceCreated(SurfaceHolder surfaceHolder) {
+                    try {
+                        if (rtmpStream != null && !rtmpStream.isOnPreview()) {
+                            rtmpStream.startPreview(surfaceViewPreview);
+                        }
+                    } catch (IllegalArgumentException e) {
+                        Log.e("RTMP", "Erro ao iniciar preview: " + e.getMessage());
+                    }
+                    surfaceHolder.removeCallback(this);
+                    scheduleRtmpPublish();
+                }
+
+                @Override public void surfaceChanged(SurfaceHolder surfaceHolder, int format, int width, int height) {}
+                @Override public void surfaceDestroyed(SurfaceHolder surfaceHolder) {}
+            });
+        }
+    }
+
+    private final Runnable rtmpPublishRunnable = this::startRtmpPublishIfReady;
+
+    /** Publish after preview/encoder warm-up so MediaMTX sees H264, not audio-only. */
+    private void scheduleRtmpPublish() {
+        rtmpHandler.removeCallbacks(rtmpPublishRunnable);
+        rtmpHandler.postDelayed(rtmpPublishRunnable, 750);
+    }
+
+    private void startRtmpPublishIfReady() {
+        if (rtmpStream == null || switchRtmp == null || !switchRtmp.isChecked()) {
+            return;
+        }
+        if (rtmpStream.isStreaming()) {
+            rtmpPublishAttempts = 0;
+            return;
+        }
+        // Best-effort local preview. Nano SurfaceView often stays invalid after GONE→VISIBLE,
+        // but Pedro GenericStream can publish via startSources() without preview.
+        if (!rtmpStream.isOnPreview()) {
+            tryStartRtmpPreview();
+            if (!rtmpStream.isOnPreview() && rtmpPublishAttempts < 2) {
+                rtmpPublishAttempts++;
+                Log.d("RTMP", "preview not ready yet; retry before headless publish " + rtmpPublishAttempts);
+                rtmpHandler.postDelayed(rtmpPublishRunnable, 400);
+                return;
+            }
+            if (!rtmpStream.isOnPreview()) {
+                Log.w("RTMP", "publishing without local SurfaceView preview");
+                appendMessage("📡 RTMP: publishing without local preview (SurfaceView not ready)");
+            }
+        }
+        String ip = editTextIp.getText().toString().trim();
+        if (ip.isEmpty()) {
+            appendMessage("❌ RTMP: Server IP is empty");
+            return;
+        }
+        if (orbbecBodyStreamer != null) {
+            orbbecBodyStreamer.setBrokerIp(ip);
+        }
+        // Head camera always publishes live/face (Orbbec owns live/body).
+        String rtmpUrl = "rtmp://" + ip + ":1935/live/face";
+        try {
+            rtmpStream.startStream(rtmpUrl);
+            rtmpPublishAttempts = 0;
+            appendMessage("📡 Head RTMP streaming started: " + rtmpUrl);
+            Log.d("RTMP", "startStream " + rtmpUrl);
+            // Body starts from onConnectionSuccess after a short delay.
+        } catch (Exception e) {
+            Log.e("RTMP", "startStream failed: " + e.getMessage());
+            appendMessage("❌ RTMP startStream failed: " + e.getMessage());
+            if (rtmpPublishAttempts++ < 5) {
+                rtmpHandler.postDelayed(rtmpPublishRunnable, 1000);
+            }
         }
     }
 
@@ -1203,12 +1895,20 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
 
     @Override
     public void onConnectionSuccess() {
-        appendMessage("✅ RTMP: Successfully connected.");
+        appendMessage("✅ RTMP: Successfully connected (live/face).");
+        if (switchRtmp != null && switchRtmp.isChecked()) {
+            scheduleOrbbecBodyAfterHead();
+        }
     }
 
     @Override
     public void onConnectionFailed(String reason) {
         appendMessage("❌ RTMP: Connection failed: " + reason);
+        // Retry head a few times; do not start body until face is up.
+        if (switchRtmp != null && switchRtmp.isChecked() && rtmpPublishAttempts < 5) {
+            rtmpPublishAttempts++;
+            rtmpHandler.postDelayed(rtmpPublishRunnable, 1500);
+        }
     }
 
     @Override
@@ -1232,6 +1932,8 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
     }
 
     private void stopRtmpStream() {
+        rtmpHandler.removeCallbacks(rtmpPublishRunnable);
+        rtmpPublishAttempts = 0;
         if (rtmpStream != null) {
             if (rtmpStream.isStreaming()) {
                 rtmpStream.stopStream();
@@ -1239,6 +1941,11 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
             if (rtmpStream.isOnPreview()) {
                 rtmpStream.stopPreview();
             }
+            try {
+                rtmpStream.release();
+            } catch (Exception ignored) {
+            }
+            rtmpStream = null;
             appendMessage("🛑 RTMP streaming stopped by user.");
         }
     }
