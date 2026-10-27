@@ -24,6 +24,9 @@ public class ControlWebSocketServer extends WebSocketServer {
         String onControlMessage(String path, JSONObject body);
 
         void onWsLog(String message);
+
+        /** Fired when a LAN client (e.g. My Sanbot) connects — used to open companion apps. */
+        void onWsClientConnected();
     }
 
     private static final String TAG = "ControlWS";
@@ -42,6 +45,11 @@ public class ControlWebSocketServer extends WebSocketServer {
         Log.i(TAG, "Client connected: " + conn.getRemoteSocketAddress());
         if (listener != null) {
             listener.onWsLog("WS client connected: " + conn.getRemoteSocketAddress());
+            try {
+                listener.onWsClientConnected();
+            } catch (Exception e) {
+                Log.w(TAG, "onWsClientConnected", e);
+            }
         }
     }
 

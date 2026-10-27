@@ -12,18 +12,25 @@ import android.view.WindowManager;
 import android.widget.*;
 import org.json.JSONObject;
 
+import java.lang.reflect.Method;
 import java.net.NetworkInterface;
 import java.util.Collections;
 import java.util.Enumeration;
 import java.util.HashMap;
 import java.util.Map;
 
+import com.sanbot.opensdk.base.BindBaseInterface;
 import com.sanbot.opensdk.base.TopBaseActivity;
 import com.sanbot.opensdk.beans.FuncConstant;
+import com.sanbot.opensdk.beans.Order;
 import com.sanbot.opensdk.function.beans.SpeakOption;
+import com.sanbot.opensdk.function.beans.handmotion.AbsoluteAngleHandMotion;
+import com.sanbot.opensdk.function.beans.handmotion.CombinationHandMotion;
+import com.sanbot.opensdk.function.beans.handmotion.NoAngleHandMotion;
 import com.sanbot.opensdk.function.beans.wheelmotion.NoAngleWheelMotion;
 import com.sanbot.opensdk.function.beans.wheelmotion.RelativeAngleWheelMotion;
 import com.sanbot.opensdk.function.unit.HDCameraManager;
+import com.sanbot.opensdk.function.unit.HandMotionManager;
 import com.sanbot.opensdk.function.unit.HardWareManager;
 import com.sanbot.opensdk.function.unit.SpeechManager;
 import com.sanbot.opensdk.function.unit.SystemManager;
@@ -79,6 +86,9 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
     private ScrollView scrollView;
     private Switch switchRtmp;
     private Switch switchWsControl;
+    private Switch switchAutoStartProxy;
+    private Switch switchOpenProxyOnConnect;
+    private Button buttonStartProxy;
     private SurfaceView surfaceViewPreview;
     private Spinner spinnerLanguage;
     private CheckBox checkBoxShowLogs;
@@ -111,9 +121,15 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
     private static final int WS_CONTROL_PORT = 8080;
 
     private SystemManager systemManager;
+    /**
+     * Last operator Mute/Unmute from /system. Nano often denies writing
+     * Settings.System volume_master_mute — keep /info honest. Speak never changes this.
+     */
+    private volatile Boolean lastAppliedMasterMute;
     private HardWareManager hardWareManager;
     private WheelMotionManager wheelMotionManager;
     private HeadMotionManager headMotionManager;
+    private HandMotionManager handMotionManager;
     private SpeechManager speechManager;
     private HDCameraManager hdCameraManager;
 
@@ -180,6 +196,9 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
         surfaceViewPreview.setVisibility(View.GONE);
         switchRtmp = findViewById(R.id.switchRtmp);
         switchWsControl = findViewById(R.id.switchWsControl);
+        switchAutoStartProxy = findViewById(R.id.switchAutoStartProxy);
+        switchOpenProxyOnConnect = findViewById(R.id.switchOpenProxyOnConnect);
+        buttonStartProxy = findViewById(R.id.buttonStartProxy);
         spinnerLanguage = findViewById(R.id.spinnerLanguage);
         checkBoxShowLogs = findViewById(R.id.checkBoxShowLogs);
         checkBoxAutoConnect = findViewById(R.id.checkBoxAutoConnect);
@@ -242,6 +261,35 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
             if (wsControlOn) {
                 startControlWebSocket();
             }
+        }
+        if (switchAutoStartProxy != null) {
+            switchAutoStartProxy.setChecked(
+                    prefs.getBoolean(OpenSdkProxyLauncher.KEY_AUTO_START_PROXY, false));
+            switchAutoStartProxy.setOnCheckedChangeListener((buttonView, isChecked) ->
+                    getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                            .putBoolean(OpenSdkProxyLauncher.KEY_AUTO_START_PROXY, isChecked)
+                            .apply());
+        }
+        if (switchOpenProxyOnConnect != null) {
+            switchOpenProxyOnConnect.setChecked(
+                    prefs.getBoolean(OpenSdkProxyLauncher.KEY_OPEN_PROXY_ON_CONNECT, true));
+            switchOpenProxyOnConnect.setOnCheckedChangeListener((buttonView, isChecked) ->
+                    getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                            .putBoolean(OpenSdkProxyLauncher.KEY_OPEN_PROXY_ON_CONNECT, isChecked)
+                            .apply());
+        }
+        if (buttonStartProxy != null) {
+            buttonStartProxy.setOnClickListener(v -> {
+                if (!OpenSdkProxyLauncher.isInstalled(this)) {
+                    appendMessage("❌ OpenSDK Proxy not installed ("
+                            + OpenSdkProxyLauncher.PROXY_PACKAGE + ")");
+                    return;
+                }
+                boolean ok = OpenSdkProxyLauncher.launch(this);
+                appendMessage(ok
+                        ? "🚀 OpenSDK Proxy launched (WS :8081 · HTTP :8082)"
+                        : "❌ Failed to launch OpenSDK Proxy");
+            });
         }
         if (editTextPort != null && lastPort != null) {
             editTextPort.setText(lastPort);
@@ -496,6 +544,15 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
         wheelMotionManager = (WheelMotionManager) getUnitManager(FuncConstant.WHEELMOTION_MANAGER);
         headMotionManager = (HeadMotionManager) getUnitManager(FuncConstant.HEADMOTION_MANAGER);
         speechManager = (SpeechManager) getUnitManager(FuncConstant.SPEECH_MANAGER);
+        try {
+            handMotionManager = (HandMotionManager) getUnitManager(FuncConstant.HANDMOTION_MANAGER);
+            appendMessage(handMotionManager != null
+                    ? "✋ HandMotionManager bound"
+                    : "⚠️ HandMotionManager null");
+        } catch (Exception e) {
+            handMotionManager = null;
+            appendMessage("⚠️ HandMotionManager: " + e.getMessage());
+        }
         startBatteryPublishingLoop();
         startInfoPublishingLoop();
 
@@ -526,6 +583,17 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
         }
         // No auto HD spike — Nano camera HAL is single-client; spike races Face RTMP.
         // Use the "HD spike stills" button with RTMP Off when needed.
+
+        // Optional companion: OpenSDK Proxy for control while this app owns cameras/RTMP.
+        if (OpenSdkProxyLauncher.isAutoStartEnabled(getSharedPreferences(PREFS_NAME, MODE_PRIVATE))) {
+            runOnUiThread(() -> {
+                if (OpenSdkProxyLauncher.launch(MainActivity.this)) {
+                    appendMessage("🚀 Auto-started OpenSDK Proxy");
+                } else if (!OpenSdkProxyLauncher.isInstalled(MainActivity.this)) {
+                    appendMessage("⚠️ Auto-start Proxy: not installed");
+                }
+            });
+        }
 
         hardWareManager.setOnHareWareListener(
                 new TouchSensorListener() {
@@ -751,6 +819,13 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
             }
         } else if (getPrefixedTopic("system").equals(topic)) {
             handleSystemControl(message);
+        } else if (getPrefixedTopic("proxy").equals(topic)
+                || getPrefixedTopic("opensdk").equals(topic)) {
+            try {
+                handleProxyCompanionRequest(new JSONObject(message));
+            } catch (Exception e) {
+                appendMessage("proxy MQTT: " + e.getMessage());
+            }
         }
     }
 
@@ -1024,26 +1099,40 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
     private void handleJointMotion(String message) {
         try {
             JSONObject json = new JSONObject(message);
-            String joint = json.optString("joint"); // "head_pan", "head_tilt", "wing_left", "wing_right"
-            int angle = json.optInt("angle"); // ângulo padrão
-            int speed = json.optInt("speed", 50); // velocidade padrão
+            String joint = json.optString("joint"); // "head_pan", "head_tilt", "wing_left", "wing_right", "wing_both"
+            int angle = json.optInt("angle");
+            int speed = json.optInt("speed", 50);
+            String action = json.optString("action", "").trim().toLowerCase(Locale.US);
+            boolean hasAngle = json.has("angle");
 
             AbsoluteAngleHeadMotion absoluteAngleHeadMotion;
 
             switch (joint) {
                 case "head_pan":
-                    absoluteAngleHeadMotion = new AbsoluteAngleHeadMotion(AbsoluteAngleHeadMotion.DIRECTION_HEAD_HORIZONTAL, AbsoluteAngleHeadMotion.ACTION_START, speed, angle);
+                    // Nano MainService: action=2 means horizontal axis (not ACTION_START).
+                    absoluteAngleHeadMotion = new AbsoluteAngleHeadMotion(
+                            AbsoluteAngleHeadMotion.DIRECTION_HEAD_HORIZONTAL,
+                            (byte) 2,
+                            speed,
+                            angle);
                     headMotionManager.doAbsoluteAngleMotion(absoluteAngleHeadMotion);
                     break;
                 case "head_tilt":
-                    absoluteAngleHeadMotion = new AbsoluteAngleHeadMotion(AbsoluteAngleHeadMotion.DIRECTION_HEAD_VERTICAL, AbsoluteAngleHeadMotion.ACTION_START, speed, angle);
+                    absoluteAngleHeadMotion = new AbsoluteAngleHeadMotion(
+                            AbsoluteAngleHeadMotion.DIRECTION_HEAD_VERTICAL,
+                            AbsoluteAngleHeadMotion.ACTION_START,
+                            speed,
+                            angle);
                     headMotionManager.doAbsoluteAngleMotion(absoluteAngleHeadMotion);
                     break;
                 case "wing_left":
-                    // TODO
+                    handleWingMotion(CombinationHandMotion.PART_LEFT, angle, action, speed, hasAngle);
                     break;
                 case "wing_right":
-                    // TODO
+                    handleWingMotion(CombinationHandMotion.PART_RIGHT, angle, action, speed, hasAngle);
+                    break;
+                case "wing_both":
+                    handleWingMotion(CombinationHandMotion.PART_BOTH, angle, action, speed, hasAngle);
                     break;
                 default:
                     break;
@@ -1051,6 +1140,236 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
         } catch (Exception e) {
             e.printStackTrace();
         }
+    }
+
+    /**
+     * Nano MainService only executes hand cmds 545–547 (Combination 4374 is a silent ACK).
+     * Discrete up/down/stop use HAND_MOTION_NO_ANGLE (545). Absolute 547 for explicit angles.
+     * If OpenSDK Proxy currently owns MainService, forward to local proxy HTTP :8082.
+     */
+    private void handleWingMotion(byte part, int angle, String action, int speed, boolean hasAngle) {
+        String jointName = part == CombinationHandMotion.PART_LEFT ? "wing_left"
+                : part == CombinationHandMotion.PART_RIGHT ? "wing_right" : "wing_both";
+        // Companion mode: proxy often holds the OpenSDK bind — forward wings there.
+        if (shouldForwardWingsToProxy()) {
+            forwardWingToProxy(jointName, angle, action, speed, hasAngle);
+            return;
+        }
+        if (handMotionManager == null) {
+            if (OpenSdkProxyLauncher.isInstalled(this)) {
+                forwardWingToProxy(jointName, angle, action, speed, hasAngle);
+            } else {
+                appendMessage("wing skipped: HandMotionManager null");
+            }
+            return;
+        }
+        writeQihanSettingInt("robot_arm_action", 1);
+        int clampedSpeed = Math.max(1, Math.min(100, speed));
+        String resolved = action == null ? "" : action.trim().toLowerCase(Locale.US);
+        try {
+            if (resolved.isEmpty() && hasAngle) {
+                sendHandAbsolute(part, clampedSpeed, Math.max(0, Math.min(270, angle)));
+                appendMessage("wing absolute part=" + part + " angle=" + angle);
+                return;
+            }
+            if (resolved.isEmpty()) {
+                resolved = angle >= 135 ? "up" : "down";
+            }
+            switch (resolved) {
+                case "up":
+                case "raise":
+                case "wave":
+                    sendHandNoAngle(part, clampedSpeed, (byte) 1 /* ACTION_UP */);
+                    appendMessage("wing up part=" + part + " via 545");
+                    break;
+                case "down":
+                case "drop":
+                    sendHandNoAngle(part, clampedSpeed, (byte) 2 /* ACTION_DOWN */);
+                    appendMessage("wing down part=" + part + " via 545");
+                    break;
+                case "reset":
+                    try {
+                        handMotionManager.doResetMotion();
+                    } catch (Exception ignored) {
+                        sendHandNoAngle(part, clampedSpeed, (byte) 2);
+                        sendHandAbsolute(part, clampedSpeed, 0);
+                    }
+                    appendMessage("wing reset");
+                    break;
+                case "stop":
+                    try {
+                        handMotionManager.doStopMotion();
+                    } catch (Exception ignored) {
+                        sendHandNoAngle(part, clampedSpeed, (byte) 0 /* ACTION_STOP */);
+                    }
+                    appendMessage("wing stop");
+                    break;
+                default:
+                    appendMessage("Unknown wing action: " + resolved);
+                    break;
+            }
+        } catch (Exception e) {
+            Log.e("MQTT", "wing send failed", e);
+            if (OpenSdkProxyLauncher.isInstalled(this)) {
+                appendMessage("wing local failed — forwarding to proxy");
+                forwardWingToProxy(jointName, angle, action, speed, hasAngle);
+            } else {
+                appendMessage("wing failed: " + e.getMessage());
+            }
+        }
+    }
+
+    /** True when OpenSDK Proxy process is alive (likely holds MainService). */
+    private boolean shouldForwardWingsToProxy() {
+        if (!OpenSdkProxyLauncher.isInstalled(this)) {
+            return false;
+        }
+        try {
+            android.app.ActivityManager am =
+                    (android.app.ActivityManager) getSystemService(ACTIVITY_SERVICE);
+            if (am == null) {
+                return false;
+            }
+            for (android.app.ActivityManager.RunningAppProcessInfo p : am.getRunningAppProcesses()) {
+                if (p != null && OpenSdkProxyLauncher.PROXY_PACKAGE.equals(p.processName)) {
+                    return true;
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return false;
+    }
+
+    private void forwardWingToProxy(String joint, int angle, String action, int speed, boolean hasAngle) {
+        new Thread(() -> {
+            try {
+                JSONObject body = new JSONObject();
+                body.put("joint", joint);
+                body.put("speed", Math.max(1, Math.min(100, speed)));
+                if (action != null && !action.trim().isEmpty()) {
+                    body.put("action", action.trim().toLowerCase(Locale.US));
+                } else if (hasAngle) {
+                    body.put("angle", angle);
+                } else {
+                    body.put("action", angle >= 135 ? "up" : "down");
+                }
+                // Ensure proxy is up so it can bind MainService.
+                OpenSdkProxyLauncher.launch(MainActivity.this);
+                byte[] bytes = body.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                java.net.HttpURLConnection conn = (java.net.HttpURLConnection)
+                        new java.net.URL("http://127.0.0.1:8082/joints").openConnection();
+                conn.setConnectTimeout(2500);
+                conn.setReadTimeout(2500);
+                conn.setRequestMethod("POST");
+                conn.setDoOutput(true);
+                conn.setRequestProperty("Content-Type", "application/json");
+                conn.getOutputStream().write(bytes);
+                int code = conn.getResponseCode();
+                conn.disconnect();
+                Log.i("MQTT", "wing forwarded to proxy HTTP " + code + " " + body);
+                runOnUiThread(() -> appendMessage("wing → proxy " + joint + " HTTP " + code));
+            } catch (Exception e) {
+                Log.w("MQTT", "wing proxy forward failed: " + e.getMessage());
+                runOnUiThread(() -> appendMessage("wing proxy forward failed: " + e.getMessage()));
+            }
+        }, "wing-proxy-fwd").start();
+    }
+
+    private void sendHandNoAngle(byte part, int speed, byte action) throws Exception {
+        // Prefer SDK bean + private doNoAngleMotion (correct Gson shape for this dsdk).
+        try {
+            NoAngleHandMotion motion = new NoAngleHandMotion(
+                    part,
+                    NoAngleHandMotion.DIRECTION_SHOULDER_FRONT_BACK,
+                    action,
+                    speed);
+            invokeHandMotion(handMotionManager, "doNoAngleMotion", NoAngleHandMotion.class, motion);
+            Log.i("MQTT", "wing NoAngle via SDK part=" + part + " action=" + action);
+            return;
+        } catch (Exception e) {
+            Log.w("MQTT", "doNoAngleMotion reflect failed, raw Order 545: " + e.getMessage());
+        }
+        JSONObject content = new JSONObject();
+        content.put("part", part);
+        content.put("direction", 1);
+        content.put("speed", speed);
+        content.put("action", action & 0xff);
+        content.put("mode", 1);
+        sendHandOrder(545, content.toString());
+    }
+
+    private void sendHandAbsolute(byte part, int speed, int degrees) throws Exception {
+        int deg = Math.max(0, Math.min(270, degrees));
+        try {
+            AbsoluteAngleHandMotion motion = new AbsoluteAngleHandMotion(
+                    part,
+                    AbsoluteAngleHandMotion.DIRECTION_SHOULDER_FRONT_BACK,
+                    AbsoluteAngleHandMotion.ACTION_START,
+                    speed,
+                    deg);
+            invokeHandMotion(handMotionManager, "doAbsoluteAngleMotion", AbsoluteAngleHandMotion.class, motion);
+            Log.i("MQTT", "wing Absolute via SDK part=" + part + " deg=" + deg);
+            return;
+        } catch (Exception e) {
+            Log.w("MQTT", "doAbsoluteAngleMotion reflect failed, raw Order 547: " + e.getMessage());
+        }
+        JSONObject content = new JSONObject();
+        content.put("part", part);
+        content.put("direction", 1);
+        content.put("action", 1);
+        content.put("speed", speed);
+        content.put("lsbAngle", deg & 0xff);
+        content.put("msbAngle", (deg >> 8) & 0xff);
+        content.put("mode", 3);
+        sendHandOrder(547, content.toString());
+    }
+
+    private void invokeHandMotion(HandMotionManager hand, String methodName, Class<?> argType, Object arg)
+            throws Exception {
+        Method m = hand.getClass().getDeclaredMethod(methodName, argType);
+        m.setAccessible(true);
+        m.invoke(hand, arg);
+    }
+
+    private void sendHandOrder(int cmd, String content) throws Exception {
+        BindBaseInterface listener = resolveHandListener(handMotionManager);
+        if (listener == null) {
+            throw new IllegalStateException("HandMotionManager listener unavailable");
+        }
+        listener.sendCommandToMainService(new Order(cmd, 0, content), null);
+        Log.i("MQTT", "wing Order cmd=" + cmd + " " + content);
+    }
+
+    private BindBaseInterface resolveHandListener(HandMotionManager hand) {
+        if (hand == null) {
+            return null;
+        }
+        String[] names = {
+                "getListener$dsdk_NormalRelease",
+                "getListener$opensdk_NormalRelease",
+                "getListener"
+        };
+        for (String name : names) {
+            try {
+                Method m = hand.getClass().getMethod(name);
+                Object result = m.invoke(hand);
+                if (result instanceof BindBaseInterface) {
+                    return (BindBaseInterface) result;
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        // Some dsdk builds expose listener as a field.
+        try {
+            java.lang.reflect.Field f = hand.getClass().getDeclaredField("listener");
+            f.setAccessible(true);
+            Object result = f.get(hand);
+            if (result instanceof BindBaseInterface) {
+                return (BindBaseInterface) result;
+            }
+        } catch (Exception ignored) {
+        }
+        return null;
     }
 
     private void handleLedControl(String message) {
@@ -1139,7 +1458,9 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
     private void subscribeToAllTopics() {
         // Commands only — do not subscribe to outbound telemetry (ir/imu/battery/…).
         // Subscribing + Show Logs caused unbounded TextView growth and ANRs.
-        String[] suffixes = new String[]{"light", "move", "joints", "led", "speak", "camera", "system"};
+        String[] suffixes = new String[]{
+                "light", "move", "joints", "led", "speak", "camera", "system", "proxy", "opensdk"
+        };
         java.util.List<String> spinnerItems = new java.util.ArrayList<>();
         spinnerItems.add("All");
 
@@ -1419,6 +1740,14 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
     }
 
     @Override
+    public void onWsClientConnected() {
+        // My Sanbot (or :8082 proxy forward) connected to ros → open OpenSDK Proxy if enabled.
+        OpenSdkProxyLauncher.maybeOpenOnClientConnect(
+                getApplicationContext(),
+                getSharedPreferences(PREFS_NAME, MODE_PRIVATE));
+    }
+
+    @Override
     public String onControlMessage(String path, JSONObject body) {
         final String p = path == null ? "" : path.trim();
         final JSONObject b = body != null ? body : new JSONObject();
@@ -1435,6 +1764,9 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
         }
         if ("/camera/mjpeg".equals(p)) {
             return buildCameraHintReply();
+        }
+        if ("/proxy".equals(p) || "/opensdk".equals(p)) {
+            return handleProxyCompanionRequest(b);
         }
         try {
             JSONObject ack = new JSONObject();
@@ -1532,6 +1864,8 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
                 break;
             case "/camera/mjpeg":
             case "/status":
+            case "/proxy":
+            case "/opensdk":
                 // replied synchronously in onControlMessage
                 break;
             case "/system":
@@ -1595,6 +1929,52 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
             return wrap.toString();
         } catch (Exception e) {
             return null;
+        }
+    }
+
+    /** Remote companion control: start / status / prefs for OpenSDK Proxy. */
+    private String handleProxyCompanionRequest(JSONObject body) {
+        try {
+            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+            String action = body.optString("action", body.optString("cmd", "status"))
+                    .trim().toLowerCase(Locale.US);
+            if ("auto".equals(action) || "set_auto".equals(action)) {
+                boolean enabled = body.optBoolean("enabled", body.optBoolean("auto", false));
+                prefs.edit().putBoolean(OpenSdkProxyLauncher.KEY_AUTO_START_PROXY, enabled).apply();
+                runOnUiThread(() -> {
+                    if (switchAutoStartProxy != null) {
+                        switchAutoStartProxy.setChecked(enabled);
+                    }
+                });
+            }
+            if ("open_on_connect".equals(action) || "set_open_on_connect".equals(action)) {
+                boolean enabled = body.optBoolean("enabled", true);
+                prefs.edit().putBoolean(OpenSdkProxyLauncher.KEY_OPEN_PROXY_ON_CONNECT, enabled).apply();
+                runOnUiThread(() -> {
+                    if (switchOpenProxyOnConnect != null) {
+                        switchOpenProxyOnConnect.setChecked(enabled);
+                    }
+                });
+            }
+            final boolean launched;
+            if ("start".equals(action) || "launch".equals(action) || "open".equals(action)) {
+                launched = OpenSdkProxyLauncher.launch(this);
+                runOnUiThread(() -> appendMessage(launched
+                        ? "🚀 OpenSDK Proxy launched (remote /proxy)"
+                        : "❌ OpenSDK Proxy launch failed"));
+            } else {
+                launched = false;
+            }
+            JSONObject payload = OpenSdkProxyLauncher.status(this, prefs);
+            payload.put("launched", launched);
+            payload.put("ok", payload.optBoolean("installed", false));
+            JSONObject wrap = new JSONObject();
+            wrap.put("path", "/proxy");
+            wrap.put("ok", true);
+            wrap.put("payload", payload);
+            return wrap.toString();
+        } catch (Exception e) {
+            return "{\"path\":\"/proxy\",\"ok\":false,\"error\":\"" + e.getMessage() + "\"}";
         }
     }
 
@@ -1694,6 +2074,12 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
                 publishInfoSnapshotSoon();
                 return;
             }
+            if ("start_proxy".equals(action) || "start_opensdk".equals(action)
+                    || "launch_proxy".equals(action)) {
+                boolean ok = OpenSdkProxyLauncher.launch(this);
+                appendMessage(ok ? "🚀 OpenSDK Proxy launched" : "❌ OpenSDK Proxy launch failed");
+                return;
+            }
             if ("volume".equals(action) || json.has("music") || json.has("system")
                     || json.has("music_pct") || json.has("system_pct") || json.has("speak")
                     || json.has("mute")) {
@@ -1780,6 +2166,7 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
                 Log.w("SanbotRosBridge", "adjustStreamVolume mute failed", e);
             }
         }
+        lastAppliedMasterMute = mute;
         try {
             if (android.provider.Settings.System.canWrite(this)) {
                 android.provider.Settings.System.putInt(
@@ -1859,9 +2246,30 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
                 json.put("volume_system_max", systemMax);
                 json.put("volume_system_pct", (system * 100) / systemMax);
             }
-            int mute = android.provider.Settings.System.getInt(
-                    getContentResolver(), "volume_master_mute", 0);
-            json.put("master_mute", mute != 0);
+            boolean muted;
+            if (lastAppliedMasterMute != null) {
+                muted = lastAppliedMasterMute;
+            } else {
+                Boolean reflected = null;
+                if (am != null) {
+                    try {
+                        java.lang.reflect.Method m = am.getClass().getMethod("isMasterMute");
+                        Object r = m.invoke(am);
+                        if (r instanceof Boolean) {
+                            reflected = (Boolean) r;
+                        }
+                    } catch (Exception ignored) {
+                    }
+                }
+                if (reflected != null) {
+                    muted = reflected;
+                } else {
+                    int mute = android.provider.Settings.System.getInt(
+                            getContentResolver(), "volume_master_mute", 0);
+                    muted = mute != 0;
+                }
+            }
+            json.put("master_mute", muted);
             Integer speakVol = readQihanSettingInt("robot_speak_volume");
             if (speakVol != null) {
                 json.put("robot_speak_volume", speakVol);

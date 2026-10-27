@@ -190,6 +190,32 @@
                 android:textSize="14sp" />
 
             <Switch
+                android:id="@+id/switchAutoStartProxy"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="Auto-start OpenSDK Proxy"
+                android:textSize="14sp" />
+
+            <Switch
+                android:id="@+id/switchOpenProxyOnConnect"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:checked="true"
+                android:text="Open Proxy when app connects"
+                android:textSize="14sp" />
+
+            <Button
+                android:id="@+id/buttonStartProxy"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:minHeight="40dp"
+                android:text="Start OpenSDK Proxy"
+                android:textSize="13sp" />
+
+            <Switch
                 android:id="@+id/switchTtsType"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
