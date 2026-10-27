@@ -23,8 +23,12 @@ import com.sanbot.opensdk.beans.FuncConstant;
 import com.sanbot.opensdk.beans.Order;
 import com.sanbot.opensdk.function.beans.EmotionsType;
 import com.sanbot.opensdk.function.beans.SpeakOption;
+import com.sanbot.opensdk.function.beans.handmotion.AbsoluteAngleHandMotion;
 import com.sanbot.opensdk.function.beans.handmotion.CombinationHandMotion;
+import com.sanbot.opensdk.function.beans.handmotion.NoAngleHandMotion;
+import com.sanbot.opensdk.function.unit.interfaces.BindBaseInterface;
 import com.sanbot.opensdk.function.beans.wheelmotion.NoAngleWheelMotion;
+import java.lang.reflect.Method;
 import com.sanbot.opensdk.function.beans.wheelmotion.RelativeAngleWheelMotion;
 import com.sanbot.opensdk.function.unit.HandMotionManager;
 import com.sanbot.opensdk.function.unit.HardWareManager;
@@ -705,7 +709,8 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
             String joint = json.optString("joint"); // "head_pan", "head_tilt", "wing_left", "wing_right", "wing_both"
             int angle = json.optInt("angle");
             int speed = json.optInt("speed", 50);
-            String action = json.optString("action", "").trim().toLowerCase();
+            String action = json.optString("action", "").trim().toLowerCase(Locale.US);
+            boolean hasAngle = json.has("angle");
 
             AbsoluteAngleHeadMotion absoluteAngleHeadMotion;
 
@@ -730,13 +735,13 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
                     headMotionManager.doAbsoluteAngleMotion(absoluteAngleHeadMotion);
                     break;
                 case "wing_left":
-                    handleWingMotion(CombinationHandMotion.PART_LEFT, angle, action, speed);
+                    handleWingMotion(CombinationHandMotion.PART_LEFT, angle, action, speed, hasAngle);
                     break;
                 case "wing_right":
-                    handleWingMotion(CombinationHandMotion.PART_RIGHT, angle, action, speed);
+                    handleWingMotion(CombinationHandMotion.PART_RIGHT, angle, action, speed, hasAngle);
                     break;
                 case "wing_both":
-                    handleWingMotion(CombinationHandMotion.PART_BOTH, angle, action, speed);
+                    handleWingMotion(CombinationHandMotion.PART_BOTH, angle, action, speed, hasAngle);
                     break;
                 default:
                     break;
@@ -748,72 +753,177 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
 
     /**
      * Wings / arms for Nano MainService (alexa_release).
-     * Up: AbsoluteAngle 547 @ 180°. Down: RelativeAngle 546 ACTION_DOWN.
+     * Discrete up/down/stop use HAND_MOTION_NO_ANGLE (545). Absolute 547 when angle is set.
      * CombinationHandMotion (4374) is ACK'd but never reaches the MCU on this firmware.
      * Keep robot_arm_action=true in settings.
      */
-    private void handleWingMotion(byte part, int angle, String action, int speed) {
+    private void handleWingMotion(byte part, int angle, String action, int speed, boolean hasAngle) {
         if (handMotionManager == null) {
+            appendMessage("wing skipped: HandMotionManager null");
             return;
         }
-        String resolved = action;
-        if (resolved.isEmpty()) {
-            resolved = angle >= 135 ? "up" : "down";
-        }
+        writeQihanSettingInt("robot_arm_action", 1);
         int clampedSpeed = Math.max(1, Math.min(100, speed));
+        String resolved = action == null ? "" : action.trim().toLowerCase(Locale.US);
         try {
+            if (resolved.isEmpty() && hasAngle) {
+                sendHandAbsolute(part, clampedSpeed, Math.max(0, Math.min(270, angle)));
+                appendMessage("wing absolute part=" + part + " angle=" + angle);
+                return;
+            }
+            if (resolved.isEmpty()) {
+                resolved = angle >= 135 ? "up" : "down";
+            }
             switch (resolved) {
                 case "up":
                 case "raise":
                 case "wave":
-                    sendHandAbsolute(part, clampedSpeed, 180);
+                    sendHandNoAngle(part, clampedSpeed, (byte) 1 /* ACTION_UP */);
+                    appendMessage("wing up part=" + part + " via 545");
                     break;
                 case "down":
                 case "drop":
+                    sendHandNoAngle(part, clampedSpeed, (byte) 2 /* ACTION_DOWN */);
+                    appendMessage("wing down part=" + part + " via 545");
+                    break;
                 case "reset":
-                    sendHandRelative(part, clampedSpeed, (byte) 2, 150);
+                    try {
+                        handMotionManager.doResetMotion();
+                    } catch (Exception ignored) {
+                        sendHandNoAngle(part, clampedSpeed, (byte) 2);
+                        sendHandAbsolute(part, clampedSpeed, 0);
+                    }
+                    appendMessage("wing reset");
                     break;
-                case "stop": {
-                    JSONObject content = new JSONObject();
-                    content.put("part", part);
-                    content.put("speed", clampedSpeed);
-                    content.put("action", 3);
-                    content.put("mode", 1);
-                    Order order = new Order(545, 0, content.toString());
-                    handMotionManager.getListener$dsdk_NormalRelease().sendCommandToMainService(order, null);
+                case "stop":
+                    try {
+                        handMotionManager.doStopMotion();
+                    } catch (Exception ignored) {
+                        sendHandNoAngle(part, clampedSpeed, (byte) 0 /* ACTION_STOP */);
+                    }
+                    appendMessage("wing stop");
                     break;
-                }
                 default:
-                    Log.w("MQTT", "Unknown wing action: " + resolved);
+                    appendMessage("Unknown wing action: " + resolved);
                     break;
             }
         } catch (Exception e) {
             Log.e("MQTT", "wing send failed", e);
+            appendMessage("wing failed: " + e.getMessage());
         }
     }
 
-    private void sendHandAbsolute(byte part, int speed, int degrees) throws Exception {
+    private void sendHandNoAngle(byte part, int speed, byte action) throws Exception {
+        // Prefer SDK bean + private doNoAngleMotion (correct Gson shape for this dsdk).
+        try {
+            NoAngleHandMotion motion = new NoAngleHandMotion(
+                    part,
+                    NoAngleHandMotion.DIRECTION_SHOULDER_FRONT_BACK,
+                    action,
+                    speed);
+            invokeHandMotion(handMotionManager, "doNoAngleMotion", NoAngleHandMotion.class, motion);
+            Log.i("MQTT", "wing NoAngle via SDK part=" + part + " action=" + action);
+            return;
+        } catch (Exception e) {
+            Log.w("MQTT", "doNoAngleMotion reflect failed, raw Order 545: " + e.getMessage());
+        }
         JSONObject content = new JSONObject();
         content.put("part", part);
+        content.put("direction", 1);
         content.put("speed", speed);
-        content.put("lsbAngle", degrees & 0xff);
-        content.put("msbAngle", (degrees >> 8) & 0xff);
-        content.put("mode", 3);
-        Order order = new Order(547, 0, content.toString());
-        handMotionManager.getListener$dsdk_NormalRelease().sendCommandToMainService(order, null);
+        content.put("action", action & 0xff);
+        content.put("mode", 1);
+        sendHandOrder(545, content.toString());
     }
 
-    /** MainService RelativeAngleHandMotion (546): {part,speed,action,lsbAngle,msbAngle,mode:2}. */
-    private void sendHandRelative(byte part, int speed, byte action, int degrees) throws Exception {
+    private void sendHandAbsolute(byte part, int speed, int degrees) throws Exception {
+        int deg = Math.max(0, Math.min(270, degrees));
+        try {
+            AbsoluteAngleHandMotion motion = new AbsoluteAngleHandMotion(
+                    part,
+                    AbsoluteAngleHandMotion.DIRECTION_SHOULDER_FRONT_BACK,
+                    AbsoluteAngleHandMotion.ACTION_START,
+                    speed,
+                    deg);
+            invokeHandMotion(handMotionManager, "doAbsoluteAngleMotion", AbsoluteAngleHandMotion.class, motion);
+            Log.i("MQTT", "wing Absolute via SDK part=" + part + " deg=" + deg);
+            return;
+        } catch (Exception e) {
+            Log.w("MQTT", "doAbsoluteAngleMotion reflect failed, raw Order 547: " + e.getMessage());
+        }
         JSONObject content = new JSONObject();
         content.put("part", part);
+        content.put("direction", 1);
+        content.put("action", 1);
         content.put("speed", speed);
-        content.put("action", action);
-        content.put("lsbAngle", degrees & 0xff);
-        content.put("msbAngle", (degrees >> 8) & 0xff);
-        content.put("mode", 2);
-        Order order = new Order(546, 0, content.toString());
-        handMotionManager.getListener$dsdk_NormalRelease().sendCommandToMainService(order, null);
+        content.put("lsbAngle", deg & 0xff);
+        content.put("msbAngle", (deg >> 8) & 0xff);
+        content.put("mode", 3);
+        sendHandOrder(547, content.toString());
+    }
+
+    private void invokeHandMotion(HandMotionManager hand, String methodName, Class<?> argType, Object arg)
+            throws Exception {
+        Method m = hand.getClass().getDeclaredMethod(methodName, argType);
+        m.setAccessible(true);
+        m.invoke(hand, arg);
+    }
+
+    private void sendHandOrder(int cmd, String content) throws Exception {
+        BindBaseInterface listener = resolveHandListener(handMotionManager);
+        if (listener == null) {
+            throw new IllegalStateException("HandMotionManager listener unavailable");
+        }
+        listener.sendCommandToMainService(new Order(cmd, 0, content), null);
+        Log.i("MQTT", "wing Order cmd=" + cmd + " " + content);
+    }
+
+    private BindBaseInterface resolveHandListener(HandMotionManager hand) {
+        if (hand == null) {
+            return null;
+        }
+        String[] names = {
+                "getListener$dsdk_NormalRelease",
+                "getListener$opensdk_NormalRelease",
+                "getListener"
+        };
+        for (String name : names) {
+            try {
+                Method m = hand.getClass().getMethod(name);
+                Object result = m.invoke(hand);
+                if (result instanceof BindBaseInterface) {
+                    return (BindBaseInterface) result;
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        try {
+            java.lang.reflect.Field f = hand.getClass().getDeclaredField("listener");
+            f.setAccessible(true);
+            Object result = f.get(hand);
+            if (result instanceof BindBaseInterface) {
+                return (BindBaseInterface) result;
+            }
+        } catch (Exception ignored) {
+        }
+        return null;
+    }
+
+    /** Best-effort Qihan settings provider write (e.g. robot_arm_action). */
+    private void writeQihanSettingInt(String key, int value) {
+        try {
+            android.net.Uri uri = android.net.Uri.parse(
+                    "content://com.qihancloud.setting.Provider/setting");
+            android.content.ContentValues values = new android.content.ContentValues();
+            values.put("key", key);
+            values.put("value", String.valueOf(value));
+            int updated = getContentResolver().update(uri, values, "key=?", new String[]{key});
+            if (updated <= 0) {
+                getContentResolver().insert(uri, values);
+            }
+        } catch (Exception e) {
+            Log.w("SanbotRosBridge", "writeQihanSettingInt " + key + " failed", e);
+        }
     }
 
     /**

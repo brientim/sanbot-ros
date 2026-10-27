@@ -13,7 +13,7 @@
 Actions: `up` / `raise` | `down` / `drop` | `stop` | `reset` | `wave`  
 Angle without action: **≥ 135 → raise**, else drop.
 
-**Nano MainService (`1.0.0_alexa_release`):** use hand Orders **547** (absolute raise), **546** (relative lower), **545** (no-angle stop). `CombinationHandMotion` / cmd **4374** is ACK’d and never reaches the MCU. Keep setting `robot_arm_action=true`.
+**Nano MainService (`1.0.0_alexa_release`):** discrete **up/down/stop** use hand Order **545** (`NoAngleHandMotion`). Explicit `angle` uses **547** (absolute). `CombinationHandMotion` / cmd **4374** is ACK’d and never reaches the MCU. Keep setting `robot_arm_action=true`.
 
 ### Head pan — `/joints`
 
@@ -60,7 +60,7 @@ Combined:
 
 | Topic / mode | Status | Notes |
 |--------------|--------|--------|
-| `/joints` pan + wings | **Tested** | Nano MainService quirks fixed (pan `action=2`, wings 545/546/547). |
+| `/joints` pan + wings | **Tested** | Nano MainService quirks fixed (pan `action=2`, wings **545** up/down + **547** absolute). |
 | `/emotion` | **Partially tested** | MQTT + MainService cmd **1091** OK; visible only on face screen. |
 | `/autonomy` **wander** | **Tested** | Starts; stops on floor joint / obstacle (expected). |
 | `/autonomy` **dock** / charge | **Not physically tested** | MQTT/cmd **785** + `changebattery` lock OK; no end-to-end run to the charging pile. |
