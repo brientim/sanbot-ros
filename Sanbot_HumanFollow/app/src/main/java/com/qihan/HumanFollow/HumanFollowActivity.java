@@ -1,20 +1,27 @@
 package com.qihan.HumanFollow;
 
+import android.Manifest;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.graphics.Color;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.speech.SpeechRecognizer;
 import android.util.Log;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
+import android.view.View;
 import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.TextView;
 
 import android.support.annotation.NonNull;
+import android.support.v4.app.ActivityCompat;
+import android.support.v4.content.ContextCompat;
 
 import com.qihan.HumanFollow.video.VisionMediaDecoder;
 import com.sanbot.opensdk.base.TopBaseActivity;
@@ -109,19 +116,28 @@ public class HumanFollowActivity extends TopBaseActivity implements SurfaceHolde
     private static final long SPEAK_STATUS_COOLDOWN_MS = 2500L;
     private static final String PREFS = "human_follow";
     private static final String PREF_SPEECH_FEEDBACK = "speech_feedback";
+    private static final String PREF_GOOGLE_TTS = "google_tts_speaker";
+    private static final String PREF_GOOGLE_ASR = "google_speech_recognizer";
+    private static final int REQ_RECORD_AUDIO = 42;
 
     private TextView statusText;
     private TextView debugText;
     private Button btnDetect;
     private Button btnStart;
     private Button btnStop;
+    private Button btnClose;
+    private Button btnCloseBottom;
     private CheckBox chkSpeechFeedback;
+    private CheckBox chkGoogleTts;
+    private CheckBox chkGoogleAsr;
     private Button btnPinHome;
     private SurfaceView surfaceView;
     private FaceOverlayView faceOverlay;
     private RadarView radarView;
     private SharedPreferences prefs;
     private boolean speechFeedbackEnabled = true;
+    private boolean googleTtsEnabled = true;
+    private boolean googleAsrEnabled = true;
     private String lastSpokenPhrase = "";
     private long lastSpokenAt;
 
@@ -132,6 +148,10 @@ public class HumanFollowActivity extends TopBaseActivity implements SurfaceHolde
     private SpeechManager speechManager;
     private SystemManager systemManager;
     private FaceTrackManager faceTrackManager;
+    private AndroidTtsSpeaker androidTts;
+    private AndroidSpeechRecognizer googleSpeech;
+    private boolean googleAsrLoopActive;
+    private final Runnable googleAsrRestartRunnable = () -> requestMicThenStartGoogleAsr();
 
     private final VisionMediaDecoder mediaDecoder = new VisionMediaDecoder();
     private final List<Integer> streamHandles = new ArrayList<>();
@@ -211,10 +231,19 @@ public class HumanFollowActivity extends TopBaseActivity implements SurfaceHolde
 
         statusText = findViewById(R.id.statusText);
         debugText = findViewById(R.id.debugText);
+        TextView versionText = findViewById(R.id.versionText);
+        if (versionText != null) {
+            versionText.setText(String.format(Locale.US, "v%s (%d)",
+                    BuildConfig.VERSION_NAME, BuildConfig.VERSION_CODE));
+        }
         btnDetect = findViewById(R.id.btnDetect);
         btnStart = findViewById(R.id.btnStart);
         btnStop = findViewById(R.id.btnStop);
+        btnClose = findViewById(R.id.btnClose);
+        btnCloseBottom = findViewById(R.id.btnCloseBottom);
         chkSpeechFeedback = findViewById(R.id.chkSpeechFeedback);
+        chkGoogleTts = findViewById(R.id.chkGoogleTts);
+        chkGoogleAsr = findViewById(R.id.chkGoogleAsr);
         btnPinHome = findViewById(R.id.btnPinHome);
         surfaceView = findViewById(R.id.sv_media);
         faceOverlay = findViewById(R.id.faceOverlay);
@@ -227,21 +256,33 @@ public class HumanFollowActivity extends TopBaseActivity implements SurfaceHolde
             setStatus("Home icons requested — check Nova desktop");
         });
         speechFeedbackEnabled = prefs.getBoolean(PREF_SPEECH_FEEDBACK, true);
-        chkSpeechFeedback.setChecked(speechFeedbackEnabled);
-        chkSpeechFeedback.setText(speechFeedbackEnabled ? R.string.speech_on : R.string.speech_off);
-        chkSpeechFeedback.setOnCheckedChangeListener((buttonView, isChecked) -> {
-            speechFeedbackEnabled = isChecked;
-            prefs.edit().putBoolean(PREF_SPEECH_FEEDBACK, isChecked).apply();
-            chkSpeechFeedback.setText(isChecked ? R.string.speech_on : R.string.speech_off);
+        googleTtsEnabled = prefs.getBoolean(PREF_GOOGLE_TTS, true);
+        googleAsrEnabled = prefs.getBoolean(PREF_GOOGLE_ASR, true);
+        bindSpeechFeedbackCheckbox();
+        chkGoogleTts.setChecked(googleTtsEnabled);
+        chkGoogleTts.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            googleTtsEnabled = isChecked;
+            prefs.edit().putBoolean(PREF_GOOGLE_TTS, isChecked).apply();
+            Log.i(TAG, "Google TTS speaker=" + isChecked);
             if (isChecked) {
-                speakFeedback(getString(R.string.speech_on), true);
-            } else if (speechManager != null) {
-                try {
-                    speechManager.stopSpeak();
-                } catch (Exception ignored) {
-                }
+                speakFeedback(getString(R.string.google_tts_on), true);
             }
         });
+        chkGoogleAsr.setChecked(googleAsrEnabled);
+        chkGoogleAsr.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            googleAsrEnabled = isChecked;
+            prefs.edit().putBoolean(PREF_GOOGLE_ASR, isChecked).apply();
+            Log.i(TAG, "Google ASR=" + isChecked);
+            if (isChecked) {
+                startGoogleAsrLoop();
+            } else {
+                stopGoogleAsrLoop();
+                tryOpenSdkWakeUp();
+            }
+        });
+
+        androidTts = new AndroidTtsSpeaker(this);
+        initGoogleSpeechRecognizer();
 
         btnDetect.setOnClickListener(v -> setDetecting(true));
         btnStart.setOnClickListener(v -> setFollowing(true));
@@ -249,6 +290,9 @@ public class HumanFollowActivity extends TopBaseActivity implements SurfaceHolde
             setFollowing(false);
             setDetecting(false, false);
         });
+        View.OnClickListener closeClick = v -> exitHumanFollow();
+        btnClose.setOnClickListener(closeClick);
+        btnCloseBottom.setOnClickListener(closeClick);
 
         surfaceView.getHolder().addCallback(this);
 
@@ -281,9 +325,42 @@ public class HumanFollowActivity extends TopBaseActivity implements SurfaceHolde
     }
 
     @Override
+    public void onBackPressed() {
+        exitHumanFollow();
+    }
+
+    /** Stop chase/detect, release camera, leave the activity (Nano has no nav bar). */
+    private void exitHumanFollow() {
+        Log.i(TAG, "exit HumanFollow");
+        try {
+            setFollowing(false, false);
+            setDetecting(false, false);
+        } catch (Exception ignored) {
+        }
+        try {
+            closeStreams();
+        } catch (Exception ignored) {
+        }
+        try {
+            mediaDecoder.stopDecoding();
+        } catch (Exception ignored) {
+        }
+        finish();
+    }
+
+    @Override
     protected void onDestroy() {
         setFollowing(false);
         setDetecting(false, false);
+        stopGoogleAsrLoop();
+        if (googleSpeech != null) {
+            googleSpeech.destroy();
+            googleSpeech = null;
+        }
+        if (androidTts != null) {
+            androidTts.shutdown();
+            androidTts = null;
+        }
         if (personScanner != null) {
             personScanner.destroy();
         }
@@ -291,6 +368,39 @@ public class HumanFollowActivity extends TopBaseActivity implements SurfaceHolde
         mediaDecoder.stopDecoding();
         mainHandler.removeCallbacksAndMessages(null);
         super.onDestroy();
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions,
+            @NonNull int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode != REQ_RECORD_AUDIO) {
+            return;
+        }
+        if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            startGoogleAsrLoop();
+        } else {
+            Log.w(TAG, "RECORD_AUDIO denied — falling back to OpenSDK ASR");
+            googleAsrEnabled = false;
+            if (prefs != null) {
+                prefs.edit().putBoolean(PREF_GOOGLE_ASR, false).apply();
+            }
+            if (chkGoogleAsr != null) {
+                chkGoogleAsr.setOnCheckedChangeListener(null);
+                chkGoogleAsr.setChecked(false);
+                chkGoogleAsr.setOnCheckedChangeListener((buttonView, isChecked) -> {
+                    googleAsrEnabled = isChecked;
+                    prefs.edit().putBoolean(PREF_GOOGLE_ASR, isChecked).apply();
+                    if (isChecked) {
+                        startGoogleAsrLoop();
+                    } else {
+                        stopGoogleAsrLoop();
+                        tryOpenSdkWakeUp();
+                    }
+                });
+            }
+            tryOpenSdkWakeUp();
+        }
     }
 
     private void bindManagers() {
@@ -491,11 +601,132 @@ public class HumanFollowActivity extends TopBaseActivity implements SurfaceHolde
             }
         });
 
+        if (useGoogleSpeechRecognizer()) {
+            Log.i(TAG, "voice listen via Google SpeechRecognizer");
+            startGoogleAsrLoop();
+        } else {
+            tryOpenSdkWakeUp();
+        }
+    }
+
+    private void initGoogleSpeechRecognizer() {
+        googleSpeech = new AndroidSpeechRecognizer(this);
+        googleSpeech.setListener(new AndroidSpeechRecognizer.Listener() {
+            @Override
+            public void onFinalResult(String text) {
+                handleVoiceUtterance(text);
+                // Wait for TTS / mic settle before next listen.
+                restartGoogleListeningSoon(900L);
+            }
+
+            @Override
+            public void onListeningStarted() {
+                runOnUiThread(() -> {
+                    if (!following) {
+                        setStatus(getString(R.string.status_listening));
+                    }
+                });
+            }
+
+            @Override
+            public void onListeningEnded() {
+                // Results/errors usually follow; avoid double-restart stampede.
+            }
+
+            @Override
+            public void onError(int errorCode, String message) {
+                Log.w(TAG, "Google STT error " + errorCode + " " + message);
+                if (!googleAsrLoopActive || !useGoogleSpeechRecognizer()) {
+                    return;
+                }
+                if (errorCode == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) {
+                    restartGoogleListeningSoon(2000L);
+                } else if (errorCode == SpeechRecognizer.ERROR_SPEECH_TIMEOUT
+                        || errorCode == SpeechRecognizer.ERROR_NO_MATCH
+                        || errorCode == SpeechRecognizer.ERROR_CLIENT) {
+                    restartGoogleListeningSoon(800L);
+                } else if (errorCode == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
+                    requestMicThenStartGoogleAsr();
+                }
+            }
+        });
+    }
+
+    private boolean useGoogleSpeechRecognizer() {
+        return googleAsrEnabled
+                && googleSpeech != null
+                && AndroidSpeechRecognizer.isRecognitionAvailable(this);
+    }
+
+    private void startGoogleAsrLoop() {
+        googleAsrLoopActive = true;
+        mainHandler.removeCallbacks(googleAsrRestartRunnable);
+        requestMicThenStartGoogleAsr();
+    }
+
+    private void stopGoogleAsrLoop() {
+        googleAsrLoopActive = false;
+        mainHandler.removeCallbacks(googleAsrRestartRunnable);
+        if (googleSpeech != null) {
+            googleSpeech.stopListening();
+        }
+    }
+
+    private void requestMicThenStartGoogleAsr() {
+        if (!googleAsrLoopActive || !useGoogleSpeechRecognizer()) {
+            return;
+        }
+        if (googleSpeech != null && googleSpeech.isListening()) {
+            return;
+        }
+        if (Build.VERSION.SDK_INT >= 23
+                && ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+                != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(this,
+                    new String[]{Manifest.permission.RECORD_AUDIO}, REQ_RECORD_AUDIO);
+            return;
+        }
+        if (googleSpeech != null) {
+            googleSpeech.startListening();
+        }
+    }
+
+    private void restartGoogleListeningSoon(long delayMs) {
+        if (!googleAsrLoopActive || !useGoogleSpeechRecognizer()) {
+            return;
+        }
+        mainHandler.removeCallbacks(googleAsrRestartRunnable);
+        mainHandler.postDelayed(googleAsrRestartRunnable, delayMs);
+    }
+
+    private void tryOpenSdkWakeUp() {
+        if (speechManager == null) {
+            return;
+        }
         try {
+            Log.i(TAG, "voice listen via MainService doWakeUp");
             speechManager.doWakeUp();
         } catch (Exception e) {
             Log.w(TAG, "doWakeUp", e);
         }
+    }
+
+    private void bindSpeechFeedbackCheckbox() {
+        if (chkSpeechFeedback == null) {
+            return;
+        }
+        chkSpeechFeedback.setChecked(speechFeedbackEnabled);
+        chkSpeechFeedback.setText(speechFeedbackEnabled ? R.string.speech_on : R.string.speech_off);
+        chkSpeechFeedback.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            speechFeedbackEnabled = isChecked;
+            prefs.edit().putBoolean(PREF_SPEECH_FEEDBACK, isChecked).apply();
+            chkSpeechFeedback.setText(isChecked ? R.string.speech_on : R.string.speech_off);
+            if (isChecked) {
+                speakFeedback(getString(R.string.speech_on), true);
+            } else {
+                LocalSpeak.stop(androidTts, speechManager);
+            }
+        });
     }
 
     /** @return true if a follow command was handled (intercept MainService). */
@@ -706,12 +937,15 @@ public class HumanFollowActivity extends TopBaseActivity implements SurfaceHolde
 
     /**
      * Spoken status for testing at ~2 m. Speed/volume 50%. Honours Speech checkbox.
+     * Prefers local Google TTS when enabled; falls back to OpenSDK cloud speak.
      *
      * @param force ignore duplicate cooldown (e.g. toggle confirmation)
      */
     private void speakFeedback(String phrase, boolean force) {
-        if (!speechFeedbackEnabled || speechManager == null
-                || phrase == null || phrase.isEmpty()) {
+        if (!speechFeedbackEnabled || phrase == null || phrase.isEmpty()) {
+            return;
+        }
+        if (!googleTtsEnabled && speechManager == null) {
             return;
         }
         long now = System.currentTimeMillis();
@@ -727,8 +961,8 @@ public class HumanFollowActivity extends TopBaseActivity implements SurfaceHolde
             opt.setSpeed(SPEECH_SPEED);
             opt.setIntonation(SPEECH_SPEED);
             applySpeakVolume(opt, SPEECH_VOLUME);
-            speechManager.stopSpeak();
-            speechManager.startSpeak(phrase, opt);
+            LocalSpeak.speak(googleTtsEnabled, androidTts, speechManager,
+                    phrase, SPEECH_SPEED, SPEECH_VOLUME, opt);
         } catch (Exception e) {
             Log.w(TAG, "speakFeedback", e);
         }
@@ -932,28 +1166,11 @@ public class HumanFollowActivity extends TopBaseActivity implements SurfaceHolde
         runOnUiThread(() -> {
             if (chkSpeechFeedback != null) {
                 chkSpeechFeedback.setOnCheckedChangeListener(null);
-                chkSpeechFeedback.setChecked(enabled);
-                chkSpeechFeedback.setText(enabled ? R.string.speech_on : R.string.speech_off);
-                chkSpeechFeedback.setOnCheckedChangeListener((buttonView, isChecked) -> {
-                    speechFeedbackEnabled = isChecked;
-                    prefs.edit().putBoolean(PREF_SPEECH_FEEDBACK, isChecked).apply();
-                    chkSpeechFeedback.setText(isChecked ? R.string.speech_on : R.string.speech_off);
-                    if (isChecked) {
-                        speakFeedback(getString(R.string.speech_on), true);
-                    } else if (speechManager != null) {
-                        try {
-                            speechManager.stopSpeak();
-                        } catch (Exception ignored) {
-                        }
-                    }
-                });
+                bindSpeechFeedbackCheckbox();
             }
         });
-        if (!enabled && speechManager != null) {
-            try {
-                speechManager.stopSpeak();
-            } catch (Exception ignored) {
-            }
+        if (!enabled) {
+            LocalSpeak.stop(androidTts, speechManager);
         }
         Log.i(TAG, "speech_feedback remote=" + enabled);
     }

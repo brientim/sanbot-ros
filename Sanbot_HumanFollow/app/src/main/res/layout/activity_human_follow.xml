@@ -55,13 +55,46 @@
         android:padding="12dp"
         android:background="#CC0F172A">
 
-        <TextView
+        <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="@string/app_name"
-            android:textColor="#F8FAFC"
-            android:textSize="20sp"
-            android:textStyle="bold" />
+            android:orientation="horizontal"
+            android:gravity="center_vertical">
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:orientation="vertical">
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="@string/app_name"
+                    android:textColor="#F8FAFC"
+                    android:textSize="20sp"
+                    android:textStyle="bold" />
+
+                <TextView
+                    android:id="@+id/versionText"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:fontFamily="monospace"
+                    android:textColor="#94A3B8"
+                    android:textSize="11sp"
+                    android:text="—" />
+            </LinearLayout>
+
+            <Button
+                android:id="@+id/btnClose"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:minHeight="48dp"
+                android:paddingLeft="16dp"
+                android:paddingRight="16dp"
+                android:text="@string/btn_close"
+                android:textSize="14sp" />
+        </LinearLayout>
 
         <TextView
             android:id="@+id/statusText"
@@ -144,13 +177,50 @@
                 android:checked="true"
                 android:text="@string/speech_on"
                 android:textColor="#E2E8F0"
-                android:textSize="13sp" />
+                android:textSize="12sp" />
+
+            <CheckBox
+                android:id="@+id/chkGoogleTts"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:checked="true"
+                android:text="@string/google_tts_on"
+                android:textColor="#E2E8F0"
+                android:textSize="12sp" />
+
+            <CheckBox
+                android:id="@+id/chkGoogleAsr"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:checked="true"
+                android:text="@string/google_asr_on"
+                android:textColor="#E2E8F0"
+                android:textSize="12sp" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginTop="4dp"
+            android:gravity="center_vertical|end">
 
             <Button
                 android:id="@+id/btnPinHome"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
+                android:layout_marginEnd="6dp"
                 android:text="@string/pin_home"
+                android:textSize="12sp" />
+
+            <Button
+                android:id="@+id/btnCloseBottom"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:minHeight="48dp"
+                android:text="@string/btn_close"
                 android:textSize="12sp" />
         </LinearLayout>
     </LinearLayout>

@@ -10,8 +10,9 @@ android {
         applicationId "com.qihan.HumanFollow"
         minSdkVersion 21
         targetSdkVersion 27
-        versionCode 1
-        versionName "1.0.0-facefollow"
+        // Bump both when shipping a Nano build so the on-screen label matches the APK/PR.
+        versionCode 4
+        versionName "1.2.0"
         multiDexEnabled true
     }
 

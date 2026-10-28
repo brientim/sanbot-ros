@@ -4,6 +4,12 @@ Replacement for the missing stock **`com.qihan.HumanFollow`** package on Sanbot 
 
 This is **not** Qihan’s original APK. It uses OpenSDK **face recognition** boxes to center on a person and keep a stand-off distance with the wheel APIs. Pair it with **`Sanbot_Ros_Bridge/`**: MQTT `/autonomy` follow launches this package.
 
+## Version
+
+Set in `app/build.gradle` (`versionName` / `versionCode`). Shown on the Human Follow HUD as **`v{versionName} ({versionCode})`**.
+
+Current: **`v1.2.0 (4)`** — Optional local **Google TTS / ASR** (default on; OpenSDK cloud fallback), HUD toggles, Close / Detect Human, sticky lock / quiet detect TTS.
+
 ## Behaviour
 
 - Package id: **`com.qihan.HumanFollow`** (matches MainService voice / launch intents).
@@ -14,6 +20,7 @@ This is **not** Qihan’s original APK. It uses OpenSDK **face recognition** box
 - **Accessibility gesture:** raise an open hand above your face to **start/stop** follow.
 - **Voice control** (after wake): “follow me” / “stop follow” / “speech on|off” / “status”.
 - **Speech feedback** (on-screen or MQTT `speech_feedback`): status phrases at **50% speed / 50% volume**. Detect-test avoids TTS storms (no “No human” / “Detect on” chatter).
+- **Google TTS / Google ASR** (HUD checkboxes, default on): bypass unreliable Qihan MainService / iFlytek cloud speak-recognize via on-device Google TTS + `SpeechRecognizer`. Uncheck to fall back to OpenSDK. Needs Google TTS / Google Search on Nano + mic permission. (Same pattern as CapBot Nano Google TTS PR.)
 - Listens for stock broadcasts:
   - `com.qinhancloud.humanfollow.open` / `.close` (ObstacleManager typo)
   - `com.qihancloud.obstacle.humanfollow.open` / `.close`
@@ -49,18 +56,8 @@ Also install / run **`Sanbot_Ros_Bridge`** connected to your MQTT broker. Then:
 
 on topic `/autonomy` (or `/<namespace>/autonomy`). Prefer leaving the face camera clear of the ROS bridge UI while testing.
 
-Mute status TTS without re-toggling follow:
+Mute status TTS (keep follow as-is):
 
 ```json
 {"mode":"follow","speech_feedback":false}
 ```
-
-## Limits
-
-- Face follow only (no Orbbec body skeleton).
-- Stand-off uses face bbox height as a rough distance proxy.
-- Clear floor; obstacle stop is best-effort.
-
-## License
-
-MIT for this app’s source. OpenSDK remains Qihan’s — see `LICENSE`.
