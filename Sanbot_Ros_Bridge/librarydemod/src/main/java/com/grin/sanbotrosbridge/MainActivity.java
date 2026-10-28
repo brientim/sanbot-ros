@@ -7,6 +7,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowManager;
 import android.widget.*;
@@ -96,6 +97,8 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
     private CheckBox checkBoxShowLogs;
     private CheckBox checkBoxAutoConnect;
     private CheckBox checkBoxAutoLaunch;
+    private CheckBox checkBoxAutoReturnHome;
+    private EditText editTextAutoReturnSeconds;
     private Switch switchTtsType;
     private ArrayAdapter<String> androidLanguageAdapter;
     private ArrayAdapter<String> sdkLanguageAdapter;
@@ -119,8 +122,16 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
     private static final String KEY_AUTO_LAUNCH = "auto_launch";
     private static final String KEY_WS_CONTROL = "ws_control";
     private static final String KEY_CAMERA_PATH = "camera_live_path";
+    private static final String KEY_AUTO_RETURN_HOME = "auto_return_home";
+    private static final String KEY_AUTO_RETURN_SECONDS = "auto_return_seconds";
+    private static final int DEFAULT_AUTO_RETURN_SECONDS = 60;
+    private static final int MIN_AUTO_RETURN_SECONDS = 5;
+    private static final int MAX_AUTO_RETURN_SECONDS = 3600;
     private static final int CAMERA_PERMISSION_REQUEST_CODE = 200;
     private static final int WS_CONTROL_PORT = 8080;
+
+    /** Companion (OpenSDK Proxy) asked us to background after Return to Home. */
+    public static final String EXTRA_MINIMIZE_TO_HOME = "minimize_to_home";
 
     private SystemManager systemManager;
     /**
@@ -141,6 +152,7 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
     private final Handler motionHandler = new Handler(Looper.getMainLooper());
     /** Dedicated to RTMP publish warm-up — must not share motionHandler (drive used to clear it). */
     private final Handler rtmpHandler = new Handler(Looper.getMainLooper());
+    private final Runnable autoReturnHomeRunnable = this::runAutoReturnHome;
     private Runnable motionStopRunnable;
     private int rtmpPublishAttempts = 0;
 
@@ -188,6 +200,8 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
         buttonCloseBottom = findViewById(R.id.buttonCloseBottom);
         buttonGoHome = findViewById(R.id.buttonGoHome);
         buttonGoHomeBottom = findViewById(R.id.buttonGoHomeBottom);
+        Button buttonHideKeypad = findViewById(R.id.buttonHideKeypad);
+        Button buttonHideKeypadBottom = findViewById(R.id.buttonHideKeypadBottom);
         textViewVersion = findViewById(R.id.textViewVersion);
         if (textViewVersion != null) {
             textViewVersion.setText(String.format(Locale.US, "v%s (%d)",
@@ -207,6 +221,8 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
         checkBoxShowLogs = findViewById(R.id.checkBoxShowLogs);
         checkBoxAutoConnect = findViewById(R.id.checkBoxAutoConnect);
         checkBoxAutoLaunch = findViewById(R.id.checkBoxAutoLaunch);
+        checkBoxAutoReturnHome = findViewById(R.id.checkBoxAutoReturnHome);
+        editTextAutoReturnSeconds = findViewById(R.id.editTextAutoReturnSeconds);
         switchTtsType = findViewById(R.id.switchTtsType);
 
         // Configuração inicial da visibilidade dos elementos de log
@@ -304,6 +320,14 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
         if (checkBoxAutoLaunch != null) {
             checkBoxAutoLaunch.setChecked(prefs.getBoolean(KEY_AUTO_LAUNCH, true));
         }
+        if (checkBoxAutoReturnHome != null) {
+            checkBoxAutoReturnHome.setChecked(prefs.getBoolean(KEY_AUTO_RETURN_HOME, true));
+        }
+        if (editTextAutoReturnSeconds != null) {
+            int seconds = clampAutoReturnSeconds(
+                    prefs.getInt(KEY_AUTO_RETURN_SECONDS, DEFAULT_AUTO_RETURN_SECONDS));
+            editTextAutoReturnSeconds.setText(String.valueOf(seconds));
+        }
         robotName = editTextName.getText().toString().trim();
 
         mqttHandler = new MqttHandler(this, this);
@@ -383,6 +407,29 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
                             .putBoolean(KEY_AUTO_LAUNCH, isChecked)
                             .apply());
         }
+        if (checkBoxAutoReturnHome != null) {
+            checkBoxAutoReturnHome.setOnCheckedChangeListener((buttonView, isChecked) -> {
+                persistAutoReturnHomePrefs();
+                scheduleAutoReturnHome();
+            });
+        }
+        if (editTextAutoReturnSeconds != null) {
+            editTextAutoReturnSeconds.addTextChangedListener(new TextWatcher() {
+                @Override
+                public void beforeTextChanged(CharSequence s, int start, int count, int after) {
+                }
+
+                @Override
+                public void onTextChanged(CharSequence s, int start, int before, int count) {
+                }
+
+                @Override
+                public void afterTextChanged(Editable s) {
+                    persistAutoReturnHomePrefs();
+                    scheduleAutoReturnHome();
+                }
+            });
+        }
 
         buttonClear.setOnClickListener(v -> textViewMessages.setText(""));
         View.OnClickListener closeClick = v -> exitBridgeUi();
@@ -392,12 +439,26 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
         if (buttonCloseBottom != null) {
             buttonCloseBottom.setOnClickListener(closeClick);
         }
-        View.OnClickListener homeClick = v -> goHomeScreen();
+        View.OnClickListener homeClick = v -> {
+            SoftInputHider.hideActivity(this);
+            cancelAutoReturnHome();
+            goHomeScreen();
+        };
         if (buttonGoHome != null) {
             buttonGoHome.setOnClickListener(homeClick);
         }
         if (buttonGoHomeBottom != null) {
             buttonGoHomeBottom.setOnClickListener(homeClick);
+        }
+        View.OnClickListener hideKeypadClick = v -> {
+            SoftInputHider.hideActivity(this);
+            appendMessage("⌨️ Keypad hidden");
+        };
+        if (buttonHideKeypad != null) {
+            buttonHideKeypad.setOnClickListener(hideKeypadClick);
+        }
+        if (buttonHideKeypadBottom != null) {
+            buttonHideKeypadBottom.setOnClickListener(hideKeypadClick);
         }
 
         tts = new TextToSpeech(this, this);
@@ -1513,7 +1574,25 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
     }
 
     @Override
+    protected void onNewIntent(android.content.Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        consumeMinimizeToHome(intent);
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (consumeMinimizeToHome(getIntent())) {
+            return;
+        }
+        scheduleAutoReturnHome();
+    }
+
+    @Override
     protected void onPause() {
+        // Keep auto-return armed while covered — otherwise we never minimize
+        // after Proxy/face takes the foreground mid-countdown.
         super.onPause();
         if (rtmpStream != null) {
             if (rtmpStream.isStreaming()) {
@@ -1528,6 +1607,71 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
             tts.stop();
             tts.shutdown();
         }
+    }
+
+    @Override
+    public boolean dispatchTouchEvent(MotionEvent ev) {
+        if (ev != null && ev.getAction() == MotionEvent.ACTION_DOWN) {
+            scheduleAutoReturnHome();
+        }
+        return super.dispatchTouchEvent(ev);
+    }
+
+    private void persistAutoReturnHomePrefs() {
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .edit()
+                .putBoolean(KEY_AUTO_RETURN_HOME, isAutoReturnHomeEnabled())
+                .putInt(KEY_AUTO_RETURN_SECONDS, readAutoReturnSeconds())
+                .apply();
+    }
+
+    private boolean isAutoReturnHomeEnabled() {
+        return checkBoxAutoReturnHome != null && checkBoxAutoReturnHome.isChecked();
+    }
+
+    private int readAutoReturnSeconds() {
+        if (editTextAutoReturnSeconds == null || editTextAutoReturnSeconds.getText() == null) {
+            return DEFAULT_AUTO_RETURN_SECONDS;
+        }
+        try {
+            return clampAutoReturnSeconds(
+                    Integer.parseInt(editTextAutoReturnSeconds.getText().toString().trim()));
+        } catch (Exception e) {
+            return DEFAULT_AUTO_RETURN_SECONDS;
+        }
+    }
+
+    private static int clampAutoReturnSeconds(int seconds) {
+        if (seconds < MIN_AUTO_RETURN_SECONDS) {
+            return MIN_AUTO_RETURN_SECONDS;
+        }
+        if (seconds > MAX_AUTO_RETURN_SECONDS) {
+            return MAX_AUTO_RETURN_SECONDS;
+        }
+        return seconds;
+    }
+
+    private void scheduleAutoReturnHome() {
+        cancelAutoReturnHome();
+        if (!isAutoReturnHomeEnabled()) {
+            appendMessage("🏠 Auto-return off");
+            return;
+        }
+        int seconds = readAutoReturnSeconds();
+        publishHandler.postDelayed(autoReturnHomeRunnable, seconds * 1000L);
+        appendMessage("🏠 Auto-return armed · " + seconds + "s");
+    }
+
+    private void cancelAutoReturnHome() {
+        publishHandler.removeCallbacks(autoReturnHomeRunnable);
+    }
+
+    private void runAutoReturnHome() {
+        if (!isAutoReturnHomeEnabled()) {
+            return;
+        }
+        appendMessage("🏠 Auto Return to Home Screen (" + readAutoReturnSeconds() + "s)…");
+        goHomeScreen();
     }
 
     private void checkCameraPermissions() {
@@ -1587,8 +1731,12 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
      * Close only backgrounds this app; Home brings the face launcher forward.
      */
     private void goHomeScreen() {
+        cancelAutoReturnHome();
+        SoftInputHider.hideActivity(this);
         appendMessage("🏠 Return to Home Screen…");
-        Log.i("SanbotRosBridge", "Home — doHomeAction + face launcher");
+        Log.i("SanbotRosBridge", "Home — doHomeAction + face launcher + moveTaskToBack");
+        // Stop open-on-connect from yanking Proxy/ROS back over the face.
+        CompanionOpenGate.quietAfterHome();
         if (systemManager != null) {
             try {
                 systemManager.doHomeAction();
@@ -1603,7 +1751,7 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
             home.setClassName("com.qihancloud.launcher", "com.qihancloud.launcher.MainActivity");
             home.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK
                     | android.content.Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
-                    | android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                    | android.content.Intent.FLAG_ACTIVITY_REORDER_TO_FRONT);
             startActivity(home);
         } catch (Exception e) {
             try {
@@ -1614,9 +1762,44 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
             } catch (Exception e2) {
                 Log.e("SanbotRosBridge", "Home Intent failed", e2);
                 appendMessage("Home failed: " + e2.getMessage());
-                exitBridgeUi();
             }
         }
+        // Critical on Nano: launcher Intent alone often leaves this UI fullscreen.
+        // Same path as Close — keep MQTT/WS alive in the background.
+        try {
+            boolean ok = moveTaskToBack(true);
+            appendMessage("🏠 moveTaskToBack=" + ok);
+            Log.i("SanbotRosBridge", "Home moveTaskToBack=" + ok);
+        } catch (Exception e) {
+            Log.e("SanbotRosBridge", "moveTaskToBack failed", e);
+            exitBridgeUi();
+        }
+        // Proxy may still be under/over us — ask it to background too.
+        MinimizeToHomeReceiver.notifyCompanions(this);
+    }
+
+    /**
+     * @return true if this launch was a companion minimize request (UI already
+     * backgrounded).
+     */
+    private boolean consumeMinimizeToHome(android.content.Intent intent) {
+        if (intent == null || !intent.getBooleanExtra(EXTRA_MINIMIZE_TO_HOME, false)) {
+            return false;
+        }
+        intent.removeExtra(EXTRA_MINIMIZE_TO_HOME);
+        cancelAutoReturnHome();
+        CompanionOpenGate.quietAfterHome();
+        SoftInputHider.hideActivity(this);
+        appendMessage("🏠 Companion minimize → moveTaskToBack");
+        try {
+            boolean ok = moveTaskToBack(true);
+            appendMessage("🏠 moveTaskToBack=" + ok);
+            Log.i("SanbotRosBridge", "Companion minimize moveTaskToBack=" + ok);
+        } catch (Exception e) {
+            Log.e("SanbotRosBridge", "Companion minimize failed", e);
+            exitBridgeUi();
+        }
+        return true;
     }
 
     @Override
@@ -1816,6 +1999,10 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
         if ("/proxy".equals(p) || "/opensdk".equals(p)) {
             return handleProxyCompanionRequest(b);
         }
+        if ("/theme".equals(p) || "theme".equals(p) || "/face_theme".equals(p)
+                || "face_theme".equals(p)) {
+            return handleThemeRequest(b);
+        }
         try {
             JSONObject ack = new JSONObject();
             ack.put("path", p);
@@ -1922,6 +2109,10 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
             case "/emotion":
             case "/autonomy":
                 appendMessage("WS " + normalized + " noted (bridge may need patched handlers)");
+                break;
+            case "/theme":
+            case "/face_theme":
+                // Handled synchronously in onControlMessage.
                 break;
             default:
                 appendMessage("WS unknown path: " + normalized);
@@ -2114,7 +2305,15 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
             if ("home".equals(action) || "homescreen".equals(action) || "home_screen".equals(action)
                     || "face".equals(action) || "screensaver".equals(action)
                     || "screen_saver".equals(action) || "go_home".equals(action)) {
+                SoftInputHider.hideActivity(this);
                 goHomeScreen();
+                return;
+            }
+            if ("hide_keypad".equals(action) || "hide_keyboard".equals(action)
+                    || "keypad".equals(action) || "keyboard".equals(action)
+                    || "dismiss_keyboard".equals(action)) {
+                SoftInputHider.hideActivity(this);
+                appendMessage("⌨️ Keypad hidden");
                 return;
             }
             if ("mute".equals(action)) {
@@ -2359,20 +2558,150 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
         return null;
     }
 
+    private String handleThemeRequest(JSONObject body) {
+        final JSONObject b = body != null ? body : new JSONObject();
+        try {
+            String theme = firstNonEmptyTheme(
+                    b.optString("theme", ""),
+                    b.optString("face", ""),
+                    b.optString("name", ""),
+                    b.optString("id", ""),
+                    b.optString("value", ""));
+            String action = b.optString("action", "").trim().toLowerCase(Locale.US);
+            if (!theme.isEmpty()
+                    || "set".equals(action) || "apply".equals(action) || "select".equals(action)) {
+                String normalized = normalizeFaceTheme(theme);
+                if (normalized == null) {
+                    return buildThemeReply(null, false, "Unknown theme (boy|cat|flower|girl|heart)");
+                }
+                boolean wrote = writeQihanSettingString("robot_face", normalized);
+                appendMessage("🎭 theme → " + normalized);
+                runOnUiThread(this::goHomeScreen);
+                return buildThemeReply(normalized, wrote, wrote ? null : "Failed to write robot_face");
+            }
+            return buildThemeReply(null, true, null);
+        } catch (Exception e) {
+            try {
+                JSONObject wrap = new JSONObject();
+                wrap.put("path", "/theme");
+                wrap.put("ok", false);
+                wrap.put("error", e.getMessage());
+                return wrap.toString();
+            } catch (Exception ignored) {
+                return "{\"path\":\"/theme\",\"ok\":false}";
+            }
+        }
+    }
+
+    private String buildThemeReply(String selected, boolean ok, String error) {
+        try {
+            JSONObject payload = new JSONObject();
+            String current = readQihanSettingString("robot_face");
+            if (selected != null && !selected.isEmpty()) {
+                payload.put("theme", selected);
+            } else if (current != null) {
+                payload.put("theme", current);
+            }
+            if (current != null) {
+                payload.put("current", current);
+            }
+            org.json.JSONArray themes = new org.json.JSONArray();
+            String[] known = {"boy", "cat", "flower", "girl", "heart"};
+            for (String t : known) {
+                themes.put(t);
+            }
+            payload.put("themes", themes);
+            JSONObject wrap = new JSONObject();
+            wrap.put("path", "/theme");
+            wrap.put("ok", ok);
+            if (error != null) {
+                wrap.put("error", error);
+            }
+            wrap.put("payload", payload);
+            return wrap.toString();
+        } catch (Exception e) {
+            return "{\"path\":\"/theme\",\"ok\":false}";
+        }
+    }
+
+    private static String normalizeFaceTheme(String raw) {
+        if (raw == null) {
+            return null;
+        }
+        String key = raw.trim().toLowerCase(Locale.US).replace('-', '_').replace(' ', '_');
+        if (key.isEmpty()) {
+            return null;
+        }
+        if ("default".equals(key) || "normal".equals(key)) {
+            key = "cat";
+        }
+        String[] known = {"boy", "cat", "flower", "girl", "heart"};
+        for (String k : known) {
+            if (k.equals(key)) {
+                return k;
+            }
+        }
+        java.io.File dir = new java.io.File("/sdcard/LAUNCHER_SRC/FACE_IMAGE", key);
+        return dir.isDirectory() ? key : null;
+    }
+
+    private static String firstNonEmptyTheme(String... values) {
+        if (values == null) {
+            return "";
+        }
+        for (String v : values) {
+            if (v != null && !v.trim().isEmpty()) {
+                return v.trim();
+            }
+        }
+        return "";
+    }
+
     private void writeQihanSettingInt(String key, int value) {
+        writeQihanSettingString(key, String.valueOf(value));
+    }
+
+    private boolean writeQihanSettingString(String key, String value) {
         try {
             android.net.Uri uri = android.net.Uri.parse(
                     "content://com.qihancloud.setting.Provider/setting");
             android.content.ContentValues values = new android.content.ContentValues();
             values.put("key", key);
-            values.put("value", String.valueOf(value));
+            values.put("value", value);
             int updated = getContentResolver().update(uri, values, "key=?", new String[]{key});
             if (updated <= 0) {
-                getContentResolver().insert(uri, values);
+                return getContentResolver().insert(uri, values) != null;
             }
+            return true;
         } catch (Exception e) {
-            Log.w("SanbotRosBridge", "writeQihanSettingInt " + key + " failed", e);
+            Log.w("SanbotRosBridge", "writeQihanSettingString " + key + " failed", e);
+            return false;
         }
+    }
+
+    private String readQihanSettingString(String key) {
+        android.database.Cursor cursor = null;
+        try {
+            android.net.Uri uri = android.net.Uri.parse(
+                    "content://com.qihancloud.setting.Provider/setting");
+            cursor = getContentResolver().query(
+                    uri, new String[]{"key", "value"}, "key=?", new String[]{key}, null);
+            if (cursor != null && cursor.moveToFirst()) {
+                int idx = cursor.getColumnIndex("value");
+                if (idx >= 0) {
+                    String raw = cursor.getString(idx);
+                    if (raw != null && !raw.isEmpty()) {
+                        return raw.trim();
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        } finally {
+            if (cursor != null) {
+                cursor.close();
+            }
+        }
+        return null;
     }
 
     private void publishSpeechToMqtt(String texto) {

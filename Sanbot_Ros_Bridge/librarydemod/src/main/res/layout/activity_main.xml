@@ -52,6 +52,17 @@
             android:textSize="14sp" />
 
         <Button
+            android:id="@+id/buttonHideKeypad"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginEnd="8dp"
+            android:minHeight="48dp"
+            android:paddingLeft="12dp"
+            android:paddingRight="12dp"
+            android:text="Hide keypad"
+            android:textSize="14sp" />
+
+        <Button
             android:id="@+id/buttonClose"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
@@ -233,6 +244,39 @@
                 android:layout_marginTop="4dp"
                 android:text="TTS Android (SDK unchecked)"
                 android:textSize="14sp" />
+
+            <CheckBox
+                android:id="@+id/checkBoxAutoReturnHome"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:checked="true"
+                android:text="Auto Return to Home Screen"
+                android:textSize="14sp" />
+
+            <LinearLayout
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Seconds:"
+                    android:textSize="14sp"
+                    android:textColor="#FF222222"
+                    android:paddingEnd="6dp" />
+
+                <EditText
+                    android:id="@+id/editTextAutoReturnSeconds"
+                    android:layout_width="72dp"
+                    android:layout_height="wrap_content"
+                    android:inputType="number"
+                    android:singleLine="true"
+                    android:text="60"
+                    android:textSize="14sp" />
+            </LinearLayout>
         </LinearLayout>
 
         <LinearLayout
@@ -312,6 +356,16 @@
             android:layout_marginEnd="8dp"
             android:minHeight="48dp"
             android:text="Home"
+            android:textSize="16sp" />
+
+        <Button
+            android:id="@+id/buttonHideKeypadBottom"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginEnd="8dp"
+            android:minHeight="48dp"
+            android:text="Hide keypad"
             android:textSize="16sp" />
 
         <Button

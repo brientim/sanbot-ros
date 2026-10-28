@@ -72,6 +72,15 @@ public final class OpenSdkProxyLauncher {
         if (ctx == null || prefs == null || !isOpenOnConnectEnabled(prefs)) {
             return;
         }
+        if (CompanionOpenGate.isQuiet()) {
+            Log.i(TAG, "Skip companion open — quiet after Home");
+            return;
+        }
+        // Already running in background: do not REORDER over the face launcher.
+        if (CompanionOpenGate.isPackageProcessRunning(ctx, PROXY_PACKAGE)) {
+            Log.i(TAG, "Skip companion open — proxy already running");
+            return;
+        }
         long now = System.currentTimeMillis();
         if (now - lastConnectLaunchMs < 8000L) {
             return;
