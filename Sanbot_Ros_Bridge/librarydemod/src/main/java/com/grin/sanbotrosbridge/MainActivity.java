@@ -79,6 +79,8 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
     private Button buttonClear;
     private Button buttonClose;
     private Button buttonCloseBottom;
+    private Button buttonGoHome;
+    private Button buttonGoHomeBottom;
     private Button buttonHdSpike;
     private TextView textViewVersion;
     private Spinner spinnerTopics;
@@ -184,6 +186,8 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
         buttonClear = findViewById(R.id.buttonClear);
         buttonClose = findViewById(R.id.buttonClose);
         buttonCloseBottom = findViewById(R.id.buttonCloseBottom);
+        buttonGoHome = findViewById(R.id.buttonGoHome);
+        buttonGoHomeBottom = findViewById(R.id.buttonGoHomeBottom);
         textViewVersion = findViewById(R.id.textViewVersion);
         if (textViewVersion != null) {
             textViewVersion.setText(String.format(Locale.US, "v%s (%d)",
@@ -387,6 +391,13 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
         }
         if (buttonCloseBottom != null) {
             buttonCloseBottom.setOnClickListener(closeClick);
+        }
+        View.OnClickListener homeClick = v -> goHomeScreen();
+        if (buttonGoHome != null) {
+            buttonGoHome.setOnClickListener(homeClick);
+        }
+        if (buttonGoHomeBottom != null) {
+            buttonGoHomeBottom.setOnClickListener(homeClick);
         }
 
         tts = new TextToSpeech(this, this);
@@ -1571,6 +1582,43 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
         moveTaskToBack(true);
     }
 
+    /**
+     * Return to the stock face / home screen (OpenSDK {@code doHomeAction} + launcher Intent).
+     * Close only backgrounds this app; Home brings the face launcher forward.
+     */
+    private void goHomeScreen() {
+        appendMessage("🏠 Return to Home Screen…");
+        Log.i("SanbotRosBridge", "Home — doHomeAction + face launcher");
+        if (systemManager != null) {
+            try {
+                systemManager.doHomeAction();
+            } catch (Exception e) {
+                Log.w("SanbotRosBridge", "doHomeAction failed", e);
+                appendMessage("doHomeAction: " + e.getMessage());
+            }
+        }
+        try {
+            android.content.Intent home = new android.content.Intent(android.content.Intent.ACTION_MAIN);
+            home.addCategory(android.content.Intent.CATEGORY_HOME);
+            home.setClassName("com.qihancloud.launcher", "com.qihancloud.launcher.MainActivity");
+            home.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK
+                    | android.content.Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
+                    | android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP);
+            startActivity(home);
+        } catch (Exception e) {
+            try {
+                android.content.Intent home = new android.content.Intent(android.content.Intent.ACTION_MAIN);
+                home.addCategory(android.content.Intent.CATEGORY_HOME);
+                home.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+                startActivity(home);
+            } catch (Exception e2) {
+                Log.e("SanbotRosBridge", "Home Intent failed", e2);
+                appendMessage("Home failed: " + e2.getMessage());
+                exitBridgeUi();
+            }
+        }
+    }
+
     @Override
     protected void onDestroy() {
         stopControlWebSocket();
@@ -2042,6 +2090,7 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
     /**
      * MQTT/WS /system:
      * {"action":"reboot"}
+     * {"action":"home"} / homescreen / face / screensaver
      * {"action":"mute"} / {"action":"unmute"}
      * {"action":"volume","music_pct":80,"system_pct":50,"speak":70,"mute":false}
      * Absolute stream steps: "music":0..max, "system":0..max (optional with pct).
@@ -2060,6 +2109,12 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
                     }
                     requestDeviceReboot();
                 }, "mqtt-reboot").start();
+                return;
+            }
+            if ("home".equals(action) || "homescreen".equals(action) || "home_screen".equals(action)
+                    || "face".equals(action) || "screensaver".equals(action)
+                    || "screen_saver".equals(action) || "go_home".equals(action)) {
+                goHomeScreen();
                 return;
             }
             if ("mute".equals(action)) {

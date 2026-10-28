@@ -41,6 +41,17 @@
         </LinearLayout>
 
         <Button
+            android:id="@+id/buttonGoHome"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginEnd="8dp"
+            android:minHeight="48dp"
+            android:paddingLeft="12dp"
+            android:paddingRight="12dp"
+            android:text="Home"
+            android:textSize="14sp" />
+
+        <Button
             android:id="@+id/buttonClose"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
@@ -291,6 +302,16 @@
             android:layout_marginEnd="8dp"
             android:minHeight="48dp"
             android:text="Clear Logs"
+            android:textSize="16sp" />
+
+        <Button
+            android:id="@+id/buttonGoHomeBottom"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginEnd="8dp"
+            android:minHeight="48dp"
+            android:text="Home"
             android:textSize="16sp" />
 
         <Button
