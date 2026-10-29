@@ -66,8 +66,7 @@ import com.pedro.encoder.input.sources.video.BufferVideoSource;
 import android.hardware.Camera;
 import android.graphics.ImageFormat;
 import android.graphics.SurfaceTexture;
-import android.view.SurfaceView;
-import android.view.SurfaceHolder;
+import android.view.TextureView;
 import android.text.Editable;
 import android.text.TextWatcher;
 
@@ -92,7 +91,8 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
     private Switch switchAutoStartProxy;
     private Switch switchOpenProxyOnConnect;
     private Button buttonStartProxy;
-    private SurfaceView surfaceViewPreview;
+    private TextureView textureViewPreview;
+    private TextView textViewPreviewHint;
     private Spinner spinnerLanguage;
     private CheckBox checkBoxShowLogs;
     private CheckBox checkBoxAutoConnect;
@@ -123,6 +123,9 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
     private static final String KEY_WS_CONTROL = "ws_control";
     private static final String KEY_CAMERA_PATH = "camera_live_path";
     private static final String KEY_AUTO_RETURN_HOME = "auto_return_home";
+    private static final String KEY_SHOW_UI_LOG = "show_ui_log";
+    /** One-shot: older builds defaulted auto-return ON (breaks RTMP if Bridge leaves fg). */
+    private static final String KEY_AUTO_RETURN_HOME_MIGRATED_OFF = "auto_return_home_migrated_off";
     private static final String KEY_AUTO_RETURN_SECONDS = "auto_return_seconds";
     private static final int DEFAULT_AUTO_RETURN_SECONDS = 60;
     private static final int MIN_AUTO_RETURN_SECONDS = 5;
@@ -210,8 +213,33 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
         spinnerTopics = findViewById(R.id.spinnerTopics);
         textViewMessages = findViewById(R.id.textViewMessages);
         scrollView = findViewById(R.id.scrollView);
-        surfaceViewPreview = findViewById(R.id.surfaceViewPreview);
-        surfaceViewPreview.setVisibility(View.GONE);
+        textureViewPreview = findViewById(R.id.textureViewPreview);
+        textViewPreviewHint = findViewById(R.id.textViewPreviewHint);
+        if (textureViewPreview != null) {
+            textureViewPreview.setVisibility(View.VISIBLE);
+            textureViewPreview.setSurfaceTextureListener(new TextureView.SurfaceTextureListener() {
+                @Override
+                public void onSurfaceTextureAvailable(SurfaceTexture surface, int width, int height) {
+                    if (switchRtmp != null && switchRtmp.isChecked()) {
+                        textureViewPreview.post(() -> initRtmpStream());
+                    }
+                }
+
+                @Override
+                public void onSurfaceTextureSizeChanged(SurfaceTexture surface, int width, int height) {
+                }
+
+                @Override
+                public boolean onSurfaceTextureDestroyed(SurfaceTexture surface) {
+                    return true;
+                }
+
+                @Override
+                public void onSurfaceTextureUpdated(SurfaceTexture surface) {
+                }
+            });
+        }
+        setPreviewHintVisible(true);
         switchRtmp = findViewById(R.id.switchRtmp);
         switchWsControl = findViewById(R.id.switchWsControl);
         switchAutoStartProxy = findViewById(R.id.switchAutoStartProxy);
@@ -224,11 +252,6 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
         checkBoxAutoReturnHome = findViewById(R.id.checkBoxAutoReturnHome);
         editTextAutoReturnSeconds = findViewById(R.id.editTextAutoReturnSeconds);
         switchTtsType = findViewById(R.id.switchTtsType);
-
-        // Configuração inicial da visibilidade dos elementos de log
-        if (!checkBoxShowLogs.isChecked()) {
-            spinnerTopics.setVisibility(View.GONE);
-        }
 
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         String lastName = prefs.getString(KEY_LAST_NAME, "");
@@ -292,7 +315,7 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
         }
         if (switchOpenProxyOnConnect != null) {
             switchOpenProxyOnConnect.setChecked(
-                    prefs.getBoolean(OpenSdkProxyLauncher.KEY_OPEN_PROXY_ON_CONNECT, true));
+                    prefs.getBoolean(OpenSdkProxyLauncher.KEY_OPEN_PROXY_ON_CONNECT, false));
             switchOpenProxyOnConnect.setOnCheckedChangeListener((buttonView, isChecked) ->
                     getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
                             .putBoolean(OpenSdkProxyLauncher.KEY_OPEN_PROXY_ON_CONNECT, isChecked)
@@ -321,7 +344,14 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
             checkBoxAutoLaunch.setChecked(prefs.getBoolean(KEY_AUTO_LAUNCH, true));
         }
         if (checkBoxAutoReturnHome != null) {
-            checkBoxAutoReturnHome.setChecked(prefs.getBoolean(KEY_AUTO_RETURN_HOME, true));
+            // Default OFF — returning Home backgrounds Bridge and drops RTMP publish.
+            if (!prefs.getBoolean(KEY_AUTO_RETURN_HOME_MIGRATED_OFF, false)) {
+                prefs.edit()
+                        .putBoolean(KEY_AUTO_RETURN_HOME, false)
+                        .putBoolean(KEY_AUTO_RETURN_HOME_MIGRATED_OFF, true)
+                        .apply();
+            }
+            checkBoxAutoReturnHome.setChecked(prefs.getBoolean(KEY_AUTO_RETURN_HOME, false));
         }
         if (editTextAutoReturnSeconds != null) {
             int seconds = clampAutoReturnSeconds(
@@ -407,12 +437,7 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
                             .putBoolean(KEY_AUTO_LAUNCH, isChecked)
                             .apply());
         }
-        if (checkBoxAutoReturnHome != null) {
-            checkBoxAutoReturnHome.setOnCheckedChangeListener((buttonView, isChecked) -> {
-                persistAutoReturnHomePrefs();
-                scheduleAutoReturnHome();
-            });
-        }
+        bindAutoReturnHomeListener();
         if (editTextAutoReturnSeconds != null) {
             editTextAutoReturnSeconds.addTextChangedListener(new TextWatcher() {
                 @Override
@@ -506,17 +531,22 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
             spinnerLanguage.setSelection(0);
         });
         
-        // Configuração do CheckBox para mostrar/ocultar logs
-        checkBoxShowLogs.setOnCheckedChangeListener((buttonView, isChecked) -> {
-            if (isChecked) {
-                scrollView.setVisibility(View.VISIBLE);
-                spinnerTopics.setVisibility(View.VISIBLE);
-                appendMessage("📋 Logs enabled");
-            } else {
-                scrollView.setVisibility(View.GONE);
-                spinnerTopics.setVisibility(View.GONE);
-            }
-        });
+        if (checkBoxShowLogs != null) {
+            checkBoxShowLogs.setChecked(prefs.getBoolean(KEY_SHOW_UI_LOG, false));
+            checkBoxShowLogs.setOnCheckedChangeListener((buttonView, isChecked) -> {
+                getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                        .edit()
+                        .putBoolean(KEY_SHOW_UI_LOG, isChecked)
+                        .apply();
+                if (!isChecked) {
+                    if (textViewMessages != null) {
+                        textViewMessages.setText("");
+                    }
+                } else {
+                    appendMessage("📋 UI log on");
+                }
+            });
+        }
         
         // Verifica e solicita permissões de câmera
         checkCameraPermissions();
@@ -532,10 +562,15 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
                     checkCameraPermissions();
                     buttonView.setChecked(false);
                 } else {
+                    applyAutoReturnHomeForRtmp(true);
+                    setPreviewHintVisible(false);
                     if (rtmpStream == null || !rtmpStream.isStreaming()) {
-                        // Show SurfaceView first, then init on next layout pass so the holder is valid.
-                        surfaceViewPreview.setVisibility(View.VISIBLE);
-                        surfaceViewPreview.post(this::initRtmpStream);
+                        if (textureViewPreview != null) {
+                            textureViewPreview.setVisibility(View.VISIBLE);
+                            textureViewPreview.post(this::initRtmpStream);
+                        } else {
+                            initRtmpStream();
+                        }
                     }
                     // Orbbec body starts after head RTMP connects (see onConnectionSuccess).
                 }
@@ -543,9 +578,12 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
                 rtmpHandler.removeCallbacks(startBodyAfterHeadRunnable);
                 stopRtmpStream();
                 stopOrbbecBody();
-                surfaceViewPreview.setVisibility(View.GONE);
+                setPreviewHintVisible(true);
+                applyAutoReturnHomeForRtmp(false);
             }
         });
+        // Honor rule on cold start if RTMP switch was left On.
+        applyAutoReturnHomeForRtmp(isRtmpEnabled());
 
         editTextName.addTextChangedListener(new TextWatcher() {
             @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
@@ -559,6 +597,13 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
         });
 
         maybeAutoConnect();
+        // Nano soft keyboard / SwiftKey covers RTMP + Options if an EditText keeps focus.
+        View root = findViewById(android.R.id.content);
+        if (root != null) {
+            root.post(() -> SoftInputHider.hideActivity(this));
+        } else {
+            SoftInputHider.hideActivity(this);
+        }
     }
 
     private String readBrokerPort() {
@@ -858,7 +903,7 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
         if (!isTelemetryTopic(finalTopic)) {
             runOnUiThread(() -> {
                 if ("All".equals(selectedTopic) || selectedTopic.equals(finalTopic)) {
-                    appendMessage("[" + finalTopic + "]: " + finalMessage);
+                    appendVerboseMessage("[" + finalTopic + "]: " + finalMessage);
                 }
             });
         }
@@ -906,6 +951,7 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
             JSONObject json = new JSONObject(message);
             boolean touchedSource = json.has("source");
             boolean touchedRtmp = json.has("rtmp") || json.has("enabled") || json.has("streaming");
+            boolean touchedLogs = json.has("show_logs") || json.has("ui_log") || json.has("show_ui_log");
             if (json.has("action")) {
                 String action = json.optString("action", "").trim().toLowerCase(Locale.US);
                 if ("hd_spike".equals(action) || "spike".equals(action)) {
@@ -920,8 +966,19 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
                     return;
                 }
             }
+            if (touchedLogs) {
+                boolean on = json.has("show_logs")
+                        ? json.optBoolean("show_logs", false)
+                        : json.has("ui_log")
+                        ? json.optBoolean("ui_log", false)
+                        : json.optBoolean("show_ui_log", false);
+                setShowUiLogFromRemote(on);
+            }
+            if (!touchedSource && !touchedRtmp && !touchedLogs) {
+                appendMessage("📷 /camera needs source, rtmp, and/or show_logs");
+                return;
+            }
             if (!touchedSource && !touchedRtmp) {
-                appendMessage("📷 /camera needs source and/or rtmp");
                 return;
             }
             if (touchedSource) {
@@ -1031,7 +1088,23 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
         runOnUiThread(() -> {
             if (switchRtmp == null) return;
             if (switchRtmp.isChecked() == on) {
-                appendMessage("📡 RTMP already " + (on ? "On" : "Off"));
+                if (on) {
+                    // Proxy Play may ask for On while the switch is stuck On but publish is dead.
+                    appendMessage("📡 RTMP already On — force republish");
+                    try {
+                        stopRtmpStream();
+                    } catch (Exception ignored) {
+                    }
+                    setPreviewHintVisible(false);
+                    if (textureViewPreview != null) {
+                        textureViewPreview.setVisibility(View.VISIBLE);
+                        textureViewPreview.post(this::initRtmpStream);
+                    } else {
+                        initRtmpStream();
+                    }
+                } else {
+                    appendMessage("📡 RTMP already Off");
+                }
                 return;
             }
             appendMessage("📡 RTMP → " + (on ? "On" : "Off") + " (remote)");
@@ -1560,8 +1633,18 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
                 || topic.equals(getPrefixedTopic("speech"));
     }
 
+    private boolean isUiLogEnabled() {
+        return checkBoxShowLogs != null && checkBoxShowLogs.isChecked();
+    }
+
     private void appendMessage(String msg) {
-        if (checkBoxShowLogs != null && checkBoxShowLogs.isChecked() && textViewMessages != null) {
+        if (textViewMessages == null || msg == null || !isUiLogEnabled()) {
+            return;
+        }
+        runOnUiThread(() -> {
+            if (!isUiLogEnabled() || textViewMessages == null) {
+                return;
+            }
             textViewMessages.append(msg + "\n");
             CharSequence text = textViewMessages.getText();
             if (text != null && text.length() > MAX_LOG_CHARS) {
@@ -1570,6 +1653,29 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
             if (scrollView != null) {
                 scrollView.post(() -> scrollView.fullScroll(View.FOCUS_DOWN));
             }
+        });
+    }
+
+    /** MQTT topic spam — same gate as status lines (Show UI log). */
+    private void appendVerboseMessage(String msg) {
+        appendMessage(msg);
+    }
+
+    private void setShowUiLogFromRemote(boolean on) {
+        runOnUiThread(() -> {
+            if (checkBoxShowLogs == null) {
+                return;
+            }
+            if (checkBoxShowLogs.isChecked() == on) {
+                return;
+            }
+            checkBoxShowLogs.setChecked(on);
+        });
+    }
+
+    private void setPreviewHintVisible(boolean show) {
+        if (textViewPreviewHint != null) {
+            textViewPreviewHint.setVisibility(show ? View.VISIBLE : View.GONE);
         }
     }
 
@@ -1586,6 +1692,7 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
         if (consumeMinimizeToHome(getIntent())) {
             return;
         }
+        SoftInputHider.hideActivity(this);
         scheduleAutoReturnHome();
     }
 
@@ -1651,8 +1758,64 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
         return seconds;
     }
 
+    private boolean isRtmpEnabled() {
+        return switchRtmp != null && switchRtmp.isChecked();
+    }
+
+    private void bindAutoReturnHomeListener() {
+        if (checkBoxAutoReturnHome == null) {
+            return;
+        }
+        checkBoxAutoReturnHome.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            if (isChecked && isRtmpEnabled()) {
+                // Logical rule: RTMP On ⇒ Auto Return Home must stay Off.
+                appendMessage("🏠 Auto-return blocked while RTMP On");
+                buttonView.setChecked(false);
+                return;
+            }
+            persistAutoReturnHomePrefs();
+            scheduleAutoReturnHome();
+        });
+    }
+
+    /**
+     * RTMP On ⇒ Auto Return Home must be disabled (Bridge leaving fg kills publish).
+     * Saved prefs are preserved; checkbox is forced Off + disabled while streaming.
+     */
+    private void applyAutoReturnHomeForRtmp(boolean rtmpOn) {
+        cancelAutoReturnHome();
+        if (checkBoxAutoReturnHome == null) {
+            return;
+        }
+        if (rtmpOn) {
+            checkBoxAutoReturnHome.setOnCheckedChangeListener(null);
+            checkBoxAutoReturnHome.setChecked(false);
+            bindAutoReturnHomeListener();
+            checkBoxAutoReturnHome.setEnabled(false);
+            if (editTextAutoReturnSeconds != null) {
+                editTextAutoReturnSeconds.setEnabled(false);
+            }
+            appendMessage("🏠 Auto-return disabled while RTMP On");
+        } else {
+            checkBoxAutoReturnHome.setEnabled(true);
+            if (editTextAutoReturnSeconds != null) {
+                editTextAutoReturnSeconds.setEnabled(true);
+            }
+            boolean saved = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                    .getBoolean(KEY_AUTO_RETURN_HOME, false);
+            checkBoxAutoReturnHome.setOnCheckedChangeListener(null);
+            checkBoxAutoReturnHome.setChecked(saved);
+            bindAutoReturnHomeListener();
+            scheduleAutoReturnHome();
+        }
+    }
+
     private void scheduleAutoReturnHome() {
         cancelAutoReturnHome();
+        if (isRtmpEnabled()) {
+            appendMessage("🏠 Auto-return disabled while RTMP On");
+            return;
+        }
         if (!isAutoReturnHomeEnabled()) {
             appendMessage("🏠 Auto-return off");
             return;
@@ -1667,6 +1830,10 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
     }
 
     private void runAutoReturnHome() {
+        if (isRtmpEnabled()) {
+            appendMessage("🏠 Auto-return blocked — RTMP On (Bridge must stay foreground)");
+            return;
+        }
         if (!isAutoReturnHomeEnabled()) {
             return;
         }
@@ -1861,6 +2028,19 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
         }
     }
 
+    /**
+     * LAN host for MQTT + MediaMTX RTMP (Server IP field / last_broker_ip).
+     * Exposed on /status so OpenSDK Proxy can build WHEP/HLS URLs without guessing Nano IP.
+     */
+    private String resolveBrokerIp() {
+        String ip = sanitizeBrokerIp(editTextIp != null ? editTextIp.getText().toString() : "");
+        if (ip.isEmpty()) {
+            ip = sanitizeBrokerIp(getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                    .getString(KEY_LAST_IP, ""));
+        }
+        return ip;
+    }
+
     private void putCameraStatusFields(JSONObject payload) throws Exception {
         boolean bodyOk = orbbecBodyStreamer != null && orbbecBodyStreamer.isHealthy();
         boolean depthOk = orbbecBodyStreamer != null && orbbecBodyStreamer.isDepthHealthy();
@@ -1884,6 +2064,16 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
         if (usbOk) note.append("; USB=UVC");
         payload.put("camera_note", note.toString());
         payload.put("rtmp_on", switchRtmp != null && switchRtmp.isChecked());
+        payload.put("show_logs", isUiLogEnabled());
+        String broker = resolveBrokerIp();
+        if (!broker.isEmpty()) {
+            // Same host RTMP publish uses — Proxy / My Sanbot MediaMTX URLs.
+            payload.put("broker_ip", broker);
+            payload.put("mqtt_host", broker);
+            payload.put("last_broker_ip", broker);
+            payload.put("server_ip", broker);
+            payload.put("mediamtx_host", broker);
+        }
     }
 
     @Override
@@ -2334,6 +2524,20 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
                 appendMessage(ok ? "🚀 OpenSDK Proxy launched" : "❌ OpenSDK Proxy launch failed");
                 return;
             }
+            if ("show_logs".equals(action) || "ui_log".equals(action) || "logging".equals(action)) {
+                boolean on = json.optBoolean("enabled", json.optBoolean("show_logs", false));
+                setShowUiLogFromRemote(on);
+                return;
+            }
+            if (json.has("show_logs") || json.has("ui_log") || json.has("show_ui_log")) {
+                boolean on = json.has("show_logs")
+                        ? json.optBoolean("show_logs", false)
+                        : json.has("ui_log")
+                        ? json.optBoolean("ui_log", false)
+                        : json.optBoolean("show_ui_log", false);
+                setShowUiLogFromRemote(on);
+                return;
+            }
             if ("volume".equals(action) || json.has("music") || json.has("system")
                     || json.has("music_pct") || json.has("system_pct") || json.has("speak")
                     || json.has("mute")) {
@@ -2747,8 +2951,8 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
         if (switchRtmp == null || !switchRtmp.isChecked()) {
             return;
         }
-        if (surfaceViewPreview != null && surfaceViewPreview.getVisibility() != View.VISIBLE) {
-            surfaceViewPreview.setVisibility(View.VISIBLE);
+        if (textureViewPreview != null && textureViewPreview.getVisibility() != View.VISIBLE) {
+            textureViewPreview.setVisibility(View.VISIBLE);
         }
         rtmpPublishAttempts = 0;
         releaseFaceHalCamera();
@@ -2877,9 +3081,23 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
                     }
                     faceHalCamera.setParameters(params);
                 }
-                faceHalCamera.setPreviewTexture(new SurfaceTexture(10));
+                // MUST use setPreviewTexture (not setPreviewDisplay). SurfaceView broke
+                // H264 publish — MediaMTX live/face became AAC-only; My Sanbot / Console failed.
+                // TextureView shares the same SurfaceTexture for on-screen preview + encode path.
                 int w = best != null ? best.width : STREAM_WIDTH;
                 int h = best != null ? best.height : STREAM_HEIGHT;
+                SurfaceTexture st = null;
+                if (textureViewPreview != null && textureViewPreview.isAvailable()) {
+                    st = textureViewPreview.getSurfaceTexture();
+                }
+                if (st != null) {
+                    st.setDefaultBufferSize(w, h);
+                    faceHalCamera.setPreviewTexture(st);
+                    Log.i("RTMP", "Face HAL previewTexture → TextureView " + w + "x" + h);
+                } else {
+                    faceHalCamera.setPreviewTexture(new SurfaceTexture(10));
+                    Log.i("RTMP", "Face HAL previewTexture → SurfaceTexture(10) " + w + "x" + h);
+                }
                 return new int[]{w, h};
             } catch (Exception e) {
                 Log.e("RTMP", "Face HAL open failed", e);

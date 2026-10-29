@@ -45,7 +45,8 @@ public final class OpenSdkProxyLauncher {
     }
 
     public static boolean isOpenOnConnectEnabled(SharedPreferences prefs) {
-        return prefs != null && prefs.getBoolean(KEY_OPEN_PROXY_ON_CONNECT, true);
+        // Default false: opening Proxy Activity over Bridge kills RTMP (needs MainActivity fg).
+        return prefs != null && prefs.getBoolean(KEY_OPEN_PROXY_ON_CONNECT, false);
     }
 
     public static boolean launch(Context ctx) {
