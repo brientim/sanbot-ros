@@ -330,7 +330,7 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
                 }
                 boolean ok = OpenSdkProxyLauncher.launch(this);
                 appendMessage(ok
-                        ? "🚀 OpenSDK Proxy launched (WS :8081 · HTTP :8082)"
+                        ? "🚀 OpenSDK Proxy launched (WS :9181 · HTTP :9182 default)"
                         : "❌ Failed to launch OpenSDK Proxy");
             });
         }
@@ -1290,7 +1290,8 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
     /**
      * Nano MainService only executes hand cmds 545–547 (Combination 4374 is a silent ACK).
      * Discrete up/down/stop use HAND_MOTION_NO_ANGLE (545). Absolute 547 for explicit angles.
-     * If OpenSDK Proxy currently owns MainService, forward to local proxy HTTP :8082.
+     * If OpenSDK Proxy currently owns MainService, forward to local proxy HTTP
+     * (default :9182, legacy :8082 fallback).
      */
     private void handleWingMotion(byte part, int angle, String action, int speed, boolean hasAngle) {
         String jointName = part == CombinationHandMotion.PART_LEFT ? "wing_left"
@@ -1401,18 +1402,13 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
                 // Ensure proxy is up so it can bind MainService.
                 OpenSdkProxyLauncher.launch(MainActivity.this);
                 byte[] bytes = body.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
-                java.net.HttpURLConnection conn = (java.net.HttpURLConnection)
-                        new java.net.URL("http://127.0.0.1:8082/joints").openConnection();
-                conn.setConnectTimeout(2500);
-                conn.setReadTimeout(2500);
-                conn.setRequestMethod("POST");
-                conn.setDoOutput(true);
-                conn.setRequestProperty("Content-Type", "application/json");
-                conn.getOutputStream().write(bytes);
-                int code = conn.getResponseCode();
-                conn.disconnect();
-                Log.i("MQTT", "wing forwarded to proxy HTTP " + code + " " + body);
-                runOnUiThread(() -> appendMessage("wing → proxy " + joint + " HTTP " + code));
+                int code = OpenSdkProxyLauncher.postLocalHttp("/joints", bytes);
+                if (code > 0) {
+                    Log.i("MQTT", "wing forwarded to proxy HTTP " + code + " " + body);
+                    runOnUiThread(() -> appendMessage("wing → proxy " + joint + " HTTP " + code));
+                } else {
+                    throw new IllegalStateException("proxy HTTP :9182/:8082 unreachable");
+                }
             } catch (Exception e) {
                 Log.w("MQTT", "wing proxy forward failed: " + e.getMessage());
                 runOnUiThread(() -> appendMessage("wing proxy forward failed: " + e.getMessage()));
@@ -2162,7 +2158,7 @@ public class MainActivity extends TopBaseActivity implements MqttHandler.MqttSta
 
     @Override
     public void onWsClientConnected() {
-        // My Sanbot (or :8082 proxy forward) connected to ros → open OpenSDK Proxy if enabled.
+        // My Sanbot (or proxy HTTP forward) connected to ros → open OpenSDK Proxy if enabled.
         OpenSdkProxyLauncher.maybeOpenOnClientConnect(
                 getApplicationContext(),
                 getSharedPreferences(PREFS_NAME, MODE_PRIVATE));

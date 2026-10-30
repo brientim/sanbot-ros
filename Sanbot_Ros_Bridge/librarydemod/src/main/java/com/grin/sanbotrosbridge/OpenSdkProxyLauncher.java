@@ -9,7 +9,9 @@ import android.util.Log;
 import org.json.JSONObject;
 
 /**
- * Launch OpenSDK Proxy (control :8081 / HTML :8082) from Sanbot-ros.
+ * Launch OpenSDK Proxy from Sanbot-ros.
+ * Proxy 1.3.74+ defaults: WS :9181 / HTTP :9182 (configurable Listen ports).
+ * Legacy 8081/8082 still probed for local HTTP forwards.
  * Cameras/RTMP stay here; proxy owns remote control.
  */
 public final class OpenSdkProxyLauncher {
@@ -17,6 +19,12 @@ public final class OpenSdkProxyLauncher {
 
     public static final String PROXY_PACKAGE = "mysanbot.opensdkproxy";
     public static final String PROXY_ACTIVITY = "mysanbot.opensdkproxy.ProxyActivity";
+
+    /** Proxy 1.3.74+ default listen ports (away from ROS :8080 / MediaMTX 888x). */
+    public static final int DEFAULT_PROXY_WS_PORT = 9181;
+    public static final int DEFAULT_PROXY_HTTP_PORT = 9182;
+    /** Pre-1.3.74 defaults — keep as fallback for wing HTTP forward. */
+    public static final int LEGACY_PROXY_HTTP_PORT = 8082;
 
     public static final String KEY_AUTO_START_PROXY = "auto_start_opensdk_proxy";
     public static final String KEY_OPEN_PROXY_ON_CONNECT = "open_proxy_on_ws_connect";
@@ -101,9 +109,48 @@ public final class OpenSdkProxyLauncher {
             o.put("installed", isInstalled(ctx));
             o.put("auto_start_proxy", isAutoStartEnabled(prefs));
             o.put("open_on_connect", isOpenOnConnectEnabled(prefs));
+            o.put("default_ws_port", DEFAULT_PROXY_WS_PORT);
+            o.put("default_http_port", DEFAULT_PROXY_HTTP_PORT);
             o.put("ok", true);
         } catch (Exception ignored) {
         }
         return o;
+    }
+
+    /**
+     * POST JSON to Proxy local HTTP {@code /joints} (or other path).
+     * Tries default :9182 then legacy :8082.
+     *
+     * @return HTTP response code, or -1 if both ports fail
+     */
+    public static int postLocalHttp(String path, byte[] body) {
+        String rel = (path == null || path.isEmpty()) ? "/" : (path.startsWith("/") ? path : "/" + path);
+        int[] ports = {DEFAULT_PROXY_HTTP_PORT, LEGACY_PROXY_HTTP_PORT};
+        Exception last = null;
+        for (int port : ports) {
+            try {
+                java.net.HttpURLConnection conn = (java.net.HttpURLConnection)
+                        new java.net.URL("http://127.0.0.1:" + port + rel).openConnection();
+                conn.setConnectTimeout(2500);
+                conn.setReadTimeout(2500);
+                conn.setRequestMethod("POST");
+                conn.setDoOutput(true);
+                conn.setRequestProperty("Content-Type", "application/json");
+                if (body != null && body.length > 0) {
+                    conn.getOutputStream().write(body);
+                }
+                int code = conn.getResponseCode();
+                conn.disconnect();
+                Log.i(TAG, "POST :" + port + rel + " → HTTP " + code);
+                return code;
+            } catch (Exception e) {
+                last = e;
+                Log.w(TAG, "POST :" + port + rel + " failed: " + e.getMessage());
+            }
+        }
+        if (last != null) {
+            Log.w(TAG, "postLocalHttp exhausted ports for " + rel, last);
+        }
+        return -1;
     }
 }
